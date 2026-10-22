@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adamx"
+version = "0.1.0"
+description = "AdamW with host-offloaded state, fused SIMD CPU kernels, and layer-wise overlap with the GPU backward pass"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.1"]
+keywords = ["pytorch", "optimizer", "adamw", "offload", "simd", "avx512"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+# A C compiler for the native kernels when the system has none (e.g. Windows).
+compiler = ["ziglang"]
+test = ["pytest>=7"]
+
+[tool.setuptools]
+# csrc holds the C source compiled at runtime; listed so it ships in sdist and wheel.
+packages = ["adamx", "adamx.csrc"]
+
+[tool.setuptools.package-data]
+adamx = ["csrc/*.c"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["cuda: needs a CUDA device", "slow: long-running"]
