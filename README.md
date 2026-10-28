@@ -24,8 +24,12 @@ and works with LR schedulers and `clip_grad_norm_`. `adamx.OptiComputeAdamW` is 
 
 ## Measured results
 
-The test machine is a laptop: RTX 5090 Laptop GPU (24 GB), 24-core Intel CPU (AVX2),
-64 GB RAM, Windows.
+All numbers in this section come from two `adamx-lab` reports generated on 2026-10-28
+(`adamx-lab/reports/20261028-224442-*`). Test machine: a laptop with an NVIDIA GeForce
+RTX 5090 Laptop GPU (25.7 GB), Intel Core Ultra 9 290HX Plus (24 threads, AVX2), 68.0 GB RAM,
+Windows 11, Python 3.14.7, PyTorch 2.14.1 + CUDA 13.2, adamx 0.1.0 (native/avx2 backend).
+Compared libraries: bitsandbytes 0.50.2, torchao 0.18.0; DeepSpeed 0.19.8 (CPU kernel only,
+under WSL, because it is not installed on Windows).
 
 ### Fine-tuning a real LLM
 
@@ -38,16 +42,16 @@ whole WikiText-2 validation split (start: 2.868).
 | configuration | final val. loss | Δ vs reference | step | peak GPU | host RAM† |
 |---|---:|---:|---:|---:|---:|
 | PyTorch AdamW, FP32 weights + autocast (**reference**) | 2.6402 | | 292 ms | 19.6 GiB | |
-| PyTorch AdamW, BF16 weights + FP32 master, all on GPU | 2.6404 | +0.0002 | 281 ms | 18.8 GiB | |
+| PyTorch AdamW, BF16 weights + FP32 master, all on GPU | 2.6404 | +0.0002 | 281 ms | 18.8 GiB | <0.1 GiB |
 | **adamx, FP32 moments** | 2.6409 | +0.0008 | 395 ms | 13.2 GiB | +7.4 GiB |
 | **adamx, BF16 moments** | 2.6405 | +0.0003 | 317 ms | 13.2 GiB | +5.6 GiB |
 | **adamx, FP8 moments** | 2.6409 | +0.0007 | 305 ms | 13.2 GiB | +4.7 GiB |
-| bitsandbytes AdamW8bit, FP32 weights | 2.6433 | +0.0031 | 312 ms | 16.8 GiB | |
-| bitsandbytes AdamW8bit, BF16 weights | 2.6557 | +0.0156 | 298 ms | 14.2 GiB | |
-| bitsandbytes PagedAdamW8bit, BF16 weights | 2.6549 | +0.0147 | 306 ms | 13.3 GiB | |
+| bitsandbytes AdamW8bit, FP32 weights | 2.6433 | +0.0031 | 312 ms | 16.8 GiB | <0.1 GiB |
+| bitsandbytes AdamW8bit, BF16 weights | 2.6557 | +0.0156 | 298 ms | 14.2 GiB | <0.1 GiB |
+| bitsandbytes PagedAdamW8bit, BF16 weights | 2.6549 | +0.0147 | 306 ms | 13.3 GiB | <0.1 GiB |
 | torchao CPUOffloadOptimizer, FP32 weights | 2.6401 | −0.0001 | 525 ms | 15.9 GiB | +10.6 GiB |
 | torchao CPUOffloadOptimizer, BF16 weights | 2.6526 | +0.0124 | 341 ms | 13.2 GiB | +5.3 GiB |
-| PyTorch AdamW, BF16 weights only | 2.6526 | +0.0124 | 266 ms | 15.1 GiB | |
+| PyTorch AdamW, BF16 weights only | 2.6526 | +0.0124 | 266 ms | 15.1 GiB | <0.1 GiB |
 
 † growth of the process's resident memory beyond the all-GPU reference's.
 
@@ -61,34 +65,83 @@ whole WikiText-2 validation split (start: 2.868).
   adamx keeps BF16 weights on the GPU but the FP32 master on the host.
 * **Memory.** adamx needs 32% less GPU memory than the reference, the least of any
   configuration at reference quality, and 2.7 GiB less than torchao's offload at the same quality.
-* **Speed.** With BF16 or FP8 moments adamx is 5–9% slower than the all-GPU reference and
-  needs 40% less time per step than torchao's offload at the same quality (25% less with FP32 moments). The GPU waits once per step for the
-  last gradient's update: the embedding (136M parameters), which backward produces last and the
-  next forward needs first. With FP32 moments that update moves 28 bytes per parameter
-  through host memory, hence 395 ms. This laptop's GPU also drops its clocks whenever it
+* **Speed.** With BF16 or FP8 moments adamx is 5–9% slower than the all-GPU reference
+  (35% with FP32 moments) and needs 40% less time per step than torchao's offload at the
+  same quality (25% less with FP32 moments). The GPU waits once per step for the update of
+  the last gradient of the backward pass. This laptop's GPU also drops its clocks whenever it
   idles: a forward+backward pass that takes 251 ms back to back takes 22% longer after a 20 ms
   pause and 33% longer after a 50 ms one, which every CPU-offload optimizer pays.
 * **Host memory.** adamx's host footprint is its FP32 master, the moments and one gradient and
   one write-back buffer per parameter: with FP8 moments, less than torchao's BF16 offload,
   which keeps no FP32 master.
 
+### Fine-tuning a small LLM (quick preset)
+
+SmolLM2-135M fine-tuned on WikiText-2: 60 steps of 8 × 256 tokens, same protocol as above
+(start: 3.306). The report labels these quick-preset numbers as indicative only.
+
+| configuration | final val. loss | Δ vs reference | step | peak GPU | host RAM† |
+|---|---:|---:|---:|---:|---:|
+| PyTorch AdamW, FP32 weights + autocast (**reference**) | 3.1245 | | 94 ms | 4.74 GiB | |
+| PyTorch AdamW, BF16 weights + FP32 master, all on GPU | 3.1260 | +0.0015 | 89 ms | 4.38 GiB | <0.1 GiB |
+| **adamx, FP32 moments** | 3.1259 | +0.0014 | 115 ms | 2.86 GiB | +2.1 GiB |
+| **adamx, BF16 moments** | 3.1258 | +0.0013 | 106 ms | 2.86 GiB | +1.6 GiB |
+| **adamx, FP8 moments** | 3.1232 | −0.0013 | 105 ms | 2.86 GiB | +1.4 GiB |
+| bitsandbytes AdamW8bit, FP32 weights | 3.1246 | +0.0001 | 109 ms | 3.98 GiB | <0.1 GiB |
+| bitsandbytes AdamW8bit, BF16 weights | 3.2867 | +0.1622 | 99 ms | 3.12 GiB | <0.1 GiB |
+| bitsandbytes PagedAdamW8bit, BF16 weights | 3.2867 | +0.1622 | 102 ms | 2.87 GiB | <0.1 GiB |
+| torchao CPUOffloadOptimizer, FP32 weights | 3.1246 | +0.0001 | 157 ms | 3.71 GiB | +1.9 GiB |
+| torchao CPUOffloadOptimizer, BF16 weights | 3.2867 | +0.1622 | 132 ms | 2.86 GiB | +1.1 GiB |
+| PyTorch AdamW, BF16 weights only | 3.2866 | +0.1621 | 83 ms | 3.37 GiB | <0.1 GiB |
+
+The reference's own spread across data orders was 0.0014, so ties are called within 0.002.
+adamx uses 40% less GPU memory than the reference at the same quality. The BF16-only
+configurations kept only 10–11% of the reference's loss reduction: 2% of their weights
+changed at BF16 resolution, vs 27% for the reference. This model showed no measurable GPU
+pause penalty (±0% after 20 ms, +2% after 50 ms).
+
+### Training step, speed and GPU memory
+
+A 67M-parameter model (8 blocks, width 1024), 4,096 tokens per step, median of the timed
+steps. Except the all-GPU baseline, every configuration keeps BF16 weights on the GPU.
+
+| configuration | step | peak GPU | optimizer state |
+|---|---:|---:|---|
+| forward + backward only (no optimizer) | 30.2 ms | 0.891 GiB | none |
+| `torch.optim.AdamW` fused, on GPU (FP32 + autocast) | 35.0 ms | 1.71 GiB | FP32 weights + FP32 m, v on GPU |
+| bitsandbytes AdamW8bit | 36.5 ms | 1.02 GiB | 8-bit m, v on GPU, no FP32 master |
+| bitsandbytes PagedAdamW8bit | 37.1 ms | 0.893 GiB | 8-bit m, v in unified memory, no FP32 master |
+| torchao CPUOffloadOptimizer | 36.1 ms | 0.891 GiB | BF16 copy + BF16 m, v on CPU, no FP32 master |
+| **adamx async, FP32 moments** | 40.6 ms | 0.891 GiB | FP32 master + FP32 m, v on CPU |
+| **adamx async, BF16 moments** | 36.6 ms | 0.891 GiB | FP32 master + BF16 m, v on CPU |
+| **adamx async, FP8 moments** | 36.1 ms | 0.891 GiB | FP32 master + FP8 m, v on CPU |
+| adamx sync (`step()`), FP32 / BF16 / FP8 moments | 60.8 / 54.0 / 51.0 ms | 0.891 GiB | as above |
+
+With FP8 moments adamx is 3% slower than the all-GPU AdamW and uses 52% of its GPU memory.
+The asynchronous mode (`attach_hooks`) takes 29–33% less time per step than synchronous
+`step()` here.
+
 ### Host kernel
 
-32M parameters, 24 threads (`benchmarks/bench_kernels.py --numel 32M`):
+8M parameters, 24 threads (`benchmarks/bench_kernels.py --numel 8M`). At this size part of
+the data stays in the CPU caches, so these times are optimistic.
 
-| implementation | ms/step | GB/s |
-|---|---:|---:|
-| `torch.optim.AdamW` (foreach, CPU) | 31.9 | 28 |
-| `torch.optim.AdamW(fused=True)` (CPU) | 11.2 | 80 |
-| adamx native, FP32 moments | 10.5 | 85 |
-| adamx native, FP32 moments, BF16 gradient in + BF16 weights out | 11.8 | 76 |
-| adamx native, BF16 moments (same I/O) | 8.3 | 77 |
-| adamx native, FP8 moments (same I/O) | 7.2 | 72 |
-| adamx PyTorch fallback, FP32 / BF16 / FP8 moments | 16.0 / 32.0 / 45.2 | |
+| implementation | Windows ms/step | Windows GB/s | WSL ms/step | WSL GB/s |
+|---|---:|---:|---:|---:|
+| `torch.optim.AdamW` (foreach, CPU) | 5.83 | 38 | 7.99 | 28 |
+| `torch.optim.AdamW(fused=True)` (CPU) | 2.31 | 97 | 1.98 | 113 |
+| DeepSpeed CPUAdam | – | – | 2.22 | 101 |
+| adamx native, FP32 moments | 1.83 | 123 | 2.13 | 105 |
+| adamx native, FP32 moments, BF16 gradient in + BF16 weights out | 1.92 | 116 | 2.43 | 92 |
+| adamx native, BF16 moments (same I/O) | 1.13 | 141 | 1.68 | 95 |
+| adamx native, FP8 moments (same I/O) | 1.80 | 72 | 3.19 | 40 |
+| adamx PyTorch fallback, FP32 / BF16 / FP8 moments | 4.48 / 7.20 / 10.55 | | 94.57 / 13.38 / 16.77 | |
 
-The native kernel runs at DRAM bandwidth. Recent PyTorch already ships a fused CPU AdamW at
-the same speed for FP32 state; adamx's advantage comes from the overlap pipeline, compressed
-moments, and the BF16 write-back produced in the same pass, not from FP32 arithmetic.
+GB/s counts the minimum bytes each variant must move. The fastest adamx variant (BF16
+moments) is 2.0× faster than PyTorch's fused CPU AdamW on Windows and 1.18× under WSL.
+With FP32 moments adamx is 1.26× faster on Windows and slightly slower under WSL
+(2.13 vs 1.98 ms). FP8 moments trade kernel speed for host memory; under WSL they are the slowest
+native variant.
 
 ## Install
 
@@ -332,17 +385,23 @@ pytest                          # 83 tests; CUDA tests run when a GPU is present
 cc -O2 -pthread -o selftest tests/native/selftest.c -lm && ./selftest   # includes the kernel source
 ```
 
-What has been verified:
+Results from the 2026-10-28 report:
 
-* FP32 results equal `torch.optim.AdamW` to about 1e-7, on CPU and CUDA, in sync and async modes.
-* Covered: parameter groups, schedulers, weight tying, gradient accumulation, BF16 params,
-  exact checkpoint resume, chunked updates (bit-identical to whole-tensor updates),
-  exact-size pinned buffers, and the auto-tuner.
-* The C self-test checks every ISA path against scalar code, the FP8 codec, thread-count and
-  chunking invariance, and pools used right after creation. It passes under ASan/UBSan and TSan.
-* The suite runs on Windows (zig) and Linux (gcc).
-* `adamx-lab` (git-ignored) runs all of this plus the benchmarks and the LLM fine-tuning
-  comparison from one page, and writes the report.
+| runtime | passed | failed | skipped | native C self-test |
+|---|---:|---:|---:|---|
+| Windows, CUDA (kernel built with `python -m ziglang cc`) | 82 | 0 | 1 | passed, 216 cases, avx2 |
+| WSL Linux, CPU only (kernel built with `/usr/bin/cc`) | 61 | 0 | 0 | passed, 216 cases, avx2 |
+
+What the tests check:
+
+* adamx's updates against `torch.optim.AdamW` on CPU and GPU (FP32 tolerance: rtol 1e-6,
+  atol 1e-7), in sync and async modes.
+* Parameter groups, schedulers, weight tying, gradient accumulation, gradient clipping, BF16
+  params, checkpoint resume, chunked updates, exact-size pinned buffers, and the auto-tuner.
+* The C self-test compares the SIMD paths against scalar code and checks the FP8 codec and
+  thread-count and chunking invariance.
+* `adamx-lab` runs all of this plus the benchmarks and the LLM fine-tuning comparison from
+  one page, and writes the reports.
 
 ## Limitations / not yet verified
 
