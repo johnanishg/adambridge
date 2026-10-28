@@ -26,7 +26,7 @@ and works with LR schedulers and `clip_grad_norm_`. `adamx.OptiComputeAdamW` is 
 
 All numbers in this section come from two `adamx-lab` reports generated on 2026-10-28
 (`adamx-lab/reports/20261028-224442-*`). Test machine: a laptop with an NVIDIA GeForce
-RTX 5090 Laptop GPU (25.7 GB), Intel Core Ultra 9 290HX Plus (24 threads, AVX2), 68.0 GB RAM,
+RTX 5090 Laptop GPU (24 GiB VRAM), Intel Core Ultra 9 290HX Plus (24 threads, AVX2), 64 GiB RAM,
 Windows 11, Python 3.14.7, PyTorch 2.14.1 + CUDA 13.2, adamx 0.1.0 (native/avx2 backend).
 Compared libraries: bitsandbytes 0.50.2, torchao 0.18.0; DeepSpeed 0.19.8 (CPU kernel only,
 under WSL, because it is not installed on Windows).
