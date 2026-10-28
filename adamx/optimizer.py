@@ -60,7 +60,8 @@ class AdamX(torch.optim.Optimizer):
             PyTorch), ``'native'`` or ``'torch'``.
         numa_aware: allocate state and pin update threads on the NUMA node
             each GPU is attached to (Linux).
-        num_threads: update threads per NUMA node (default: all its CPUs).
+        num_threads: update threads per NUMA node (default: its CPUs minus
+            two, at most 32).
         chunk_size: elements per PyTorch-kernel chunk (default from L2 size).
         release_grads: in asynchronous mode, free each gradient once it has
             been copied to the host.

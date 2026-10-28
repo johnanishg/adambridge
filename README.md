@@ -194,23 +194,136 @@ H2D stream, so no device-wide synchronization is needed.
    one consumer thread per device. Lock contention isn't the bottleneck: kernels run with the
    GIL released.
 
-## API notes
+## Parameters
 
-* `release_grads=True` (default): in async mode `p.grad` is freed as soon as it is copied
-  to the host.
-* `small_param_threshold=65536`: CUDA parameters with fewer elements are updated together at
-  `step_sync()` instead of through per-tensor hooks. `0` hooks every parameter.
-* Gradient accumulation: run all but the last micro-batch under `with opt.no_sync():`.
-* Global gradient clipping is impossible in async mode, because the first layers update
-  before the last gradients exist. Use synchronous `step()` if you need it.
-* `overlap_writeback=False` defers all weight copies to `step_sync()`. You only need it if
-  something reads a parameter during backward after that parameter's gradient is complete.
-* `state_dict()` saves moments in their stored precision. `load_state_dict()` also accepts
-  `torch.optim.AdamW` checkpoints and converts precision when needed.
-* `opt.memory_report()`, `opt.last_step_stats`, `opt.autotune_log` and `opt.backend`
-  are there for inspection.
-* `opt.close()` (or dropping the optimizer) stops the worker threads and releases the
-  pinned buffers.
+```python
+adamx.AdamX(
+    params,
+    lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2,
+    *,                                   # everything below is keyword-only
+    precision="fp32", stochastic_rounding=True, backend="auto",
+    numa_aware=True, num_threads=None, chunk_size=None,
+    release_grads=True, overlap_writeback=True,
+    autotune=False, seed=0, small_param_threshold=65536,
+)
+```
+
+### AdamW hyperparameters
+
+These behave exactly as in `torch.optim.AdamW`. They can differ between parameter groups
+(pass a list of dicts as `params`) and can be changed by LR schedulers.
+
+| parameter | default | accepted values | meaning and use |
+|---|---|---|---|
+| `params` | required | iterable of tensors, or of dicts (parameter groups) | The parameters to optimize. Use groups to give, say, biases and norms `weight_decay=0`. Sparse parameters are rejected. |
+| `lr` | `1e-3` | float `>= 0` | Learning rate: the size of each update. Fine-tuning typically uses `1e-5`–`1e-4`. |
+| `betas` | `(0.9, 0.999)` | two floats, each in `[0, 1)` | Decay rates of the running averages of the gradient (`m`) and of its square (`v`). Higher values average over more steps. |
+| `eps` | `1e-8` | float `>= 0` | Added to `sqrt(v)` in the denominator so the update never divides by zero. |
+| `weight_decay` | `1e-2` | float `>= 0` | Decoupled weight decay: each step every weight is shrunk by `lr * weight_decay * w`. `0` disables it. |
+
+### Memory and precision
+
+| parameter | default | accepted values | meaning and use |
+|---|---|---|---|
+| `precision` | `"fp32"` | `"fp32"` (alias `"float32"`), `"bf16"` (aliases `"bf16_moments"`, `"bfloat16"`), `"fp8"` (alias `"fp8_moments"`); case-insensitive | How the two Adam moments are stored in host RAM: 12, 8 or ~6.06 host bytes per parameter including the FP32 master (see the table in *How it works*). Lower precision uses less RAM and is faster; in the measurements above all three reached reference quality. The FP32 master weights are kept in every mode. Can be changed later with `set_precision()`. |
+| `stochastic_rounding` | `True` | `True`, `False` | Rounds BF16/FP8 moments up or down at random, in proportion to the remainder, so tiny per-step changes accumulate on average. Has no effect with `precision="fp32"`. Keep it on: without it `v` stops changing once `beta2` is close to 1 (see *Where this deviates…*, item 1). |
+| `seed` | `0` | int | Base seed for stochastic rounding. The same seed gives bit-identical results regardless of thread count or chunking. |
+
+### Hardware and threading
+
+| parameter | default | accepted values | meaning and use |
+|---|---|---|---|
+| `backend` | `"auto"` | `"auto"`, `"native"`, `"torch"` | Which update kernel runs on the CPU. `"auto"` uses the compiled SIMD kernel when it can be built and otherwise the PyTorch fallback. `"native"` raises an error if the kernel isn't available. `"torch"` always uses the slower PyTorch kernels, which is useful for debugging. Check the result with `opt.backend`. |
+| `numa_aware` | `True` | `True`, `False` | On multi-socket Linux machines, keeps each GPU's optimizer state in the RAM attached to the CPU closest to that GPU and runs its updates on that CPU's cores. No effect on Windows, macOS, or single-socket machines. |
+| `num_threads` | `None` | `None` or int `>= 1` | CPU threads per NUMA node for the update. `None` uses all CPUs of the node minus two (left for the training loop), capped at 32. The update is limited by memory bandwidth, so more threads stop helping well before all cores are busy; `tune_threads()` or `autotune` finds the best count. |
+| `chunk_size` | `None` | `None` or a positive multiple of 128 | Elements processed per pass by the **PyTorch fallback** kernel. `None` derives it from the CPU's L2 cache size (between 262,144 and 4,194,304). Ignored by the native kernel. |
+
+### Asynchronous mode (`attach_hooks`)
+
+| parameter | default | accepted values | meaning and use |
+|---|---|---|---|
+| `release_grads` | `True` | `True`, `False` | Frees each gradient from GPU memory as soon as it has been copied to the host, so `p.grad` is `None` after `backward()`. Set `False` if your code reads `p.grad` after backward (for logging, say), at the cost of keeping all gradients on the GPU. |
+| `overlap_writeback` | `True` | `True`, `False` | Copies each updated weight back to the GPU as soon as it is ready, overlapping with the rest of backward. `False` defers all copies to `step_sync()`. Only needed if something reads a parameter during backward after that parameter's gradient is complete (only possible with `.detach()` tricks). |
+| `small_param_threshold` | `65536` | int `>= 0` | CUDA parameters with fewer elements than this (norms, biases) get no per-tensor hook and are updated together at `step_sync()`, with one transfer each way. Their update takes microseconds, while a hook costs tens of microseconds of Python. `0` hooks every parameter. |
+| `autotune` | `False` | `False`, `True`, or an `AutoTuneConfig` | Tunes the thread count and moment precision while training (see below). `True` uses `AutoTuneConfig()` defaults. Decisions are made from `step_sync()` timings and recorded in `opt.autotune_log`. |
+
+### Auto-tuning (`adamx.autotune.AutoTuneConfig`)
+
+The tuner first benchmarks thread counts once. Then, if the CPU update takes longer than the
+GPU's backward pass, it steps the moment precision down one level (`fp32` → `bf16` → `fp8`).
+It keeps the change only if the update actually got faster, and stops at the first decision.
+
+```python
+from adamx.autotune import AutoTuneConfig
+opt = adamx.AdamX(model.parameters(), autotune=AutoTuneConfig(min_precision="fp8"))
+```
+
+| field | default | accepted values | meaning and use |
+|---|---|---|---|
+| `warmup_steps` | `3` | int `>= 0` | Steps ignored at start-up and after each precision change, while caches and allocations settle. |
+| `window` | `5` | int `>= 1` | Steps measured (median) before each decision. |
+| `threshold` | `1.0` | float `> 0` | The host counts as the bottleneck when `cpu_update > threshold * gpu_backward`. Lower it to downgrade sooner. |
+| `min_precision` | `"bf16"` | any `precision` value | Lowest precision the tuner may pick. The default never selects FP8; set `"fp8"` to allow it, or `"fp32"` to disable precision tuning. |
+| `min_gain` | `0.05` | float in `[0, 1)` | A downgrade is kept only if host update time drops by at least this fraction (5%); otherwise it is reverted. |
+| `tune_threads` | `True` | `True`, `False` | Benchmark thread counts on the first tuned step and keep the fastest; within 3% of the best, the fewest threads win. Only applies to the native kernel. |
+
+### Methods
+
+| method | use |
+|---|---|
+| `step(closure=None)` | Synchronous update, as with any PyTorch optimizer: copy gradients to the host, update, copy weights back. Works with gradient clipping and LR schedulers. |
+| `zero_grad()` | As in PyTorch. |
+| `attach_hooks(model=None)` | Switches to asynchronous mode: each parameter is updated as soon as its gradient is ready during `backward()`. With `model`, only that model's parameters are hooked. Returns the optimizer. |
+| `detach_hooks()` | Back to synchronous mode. |
+| `step_sync()` | In asynchronous mode, call after `backward()` instead of `step()`. Updates the small parameters, waits for every queued update, and makes the next GPU work wait for the new weights. Returns `StepStats`. |
+| `no_sync()` | Context manager for gradient accumulation: run all but the last micro-batch inside `with opt.no_sync():`. Without it, a second gradient before `step_sync()` raises an error. |
+| `set_precision(precision)` | Re-encodes all moments in another precision between steps. |
+| `tune_threads(numel=4194304)` | Benchmarks the native kernel and sets the fastest thread count per device. Returns `{device: {threads: seconds}}`. |
+| `state_dict()` / `load_state_dict(sd)` | Checkpointing. Moments are saved in their stored precision. Loading also accepts `torch.optim.AdamW` checkpoints and converts precision when needed. |
+| `memory_report()` | Host bytes held, by category: `master`, `moments`, `staging` (transfer buffers) and `total`. |
+| `expected_bytes_per_param()` | Host bytes per parameter for master + moments at the current precision (12, 8 or ~6.06). |
+| `master_params()` | The FP32 master copies (`None` for a parameter until its first update). |
+| `close()` | Stops the worker threads and releases pinned memory. Runs automatically when the optimizer is garbage-collected. |
+
+Read-only attributes: `opt.backend` (`"native/avx2"`, `"native/avx512"`, `"native/neon"`,
+`"native/scalar"` or `"torch"`), `opt.precision`, `opt.autotune_log` (list of the tuner's
+decisions) and `opt.last_step_stats`.
+
+`step_sync()` and `opt.last_step_stats` return a `StepStats` with these fields (seconds):
+
+| field | meaning |
+|---|---|
+| `num_updates` | Parameters updated this step (a chunked update counts once). |
+| `gpu_backward` | GPU time from the first to the last gradient being ready; `None` without CUDA hooks. |
+| `cpu_update` | CPU kernel time of the busiest device worker. |
+| `stall` | How long `step_sync()` blocked the training loop, including waiting for the GPU to finish backward. |
+| `per_device_cpu` | `cpu_update` broken down by device. |
+
+### Environment variables
+
+| variable | default | meaning and use |
+|---|---|---|
+| `ADAMX_CACHE_DIR` | `~/.cache/adamx` | Where the compiled native kernel is stored. |
+| `ADAMX_CC` | unset | Compiler command to try first, e.g. `gcc`, `clang -march=native` or `cl`. |
+| `ADAMX_DISABLE_NATIVE` | unset | Any value except `0` forces the PyTorch fallback kernels. |
+| `ADAMX_SPIN` | `4000` | How long the update threads busy-wait (in CPU pause instructions) for the next job before sleeping. Higher reacts faster between updates but burns CPU; `0` sleeps immediately. |
+
+### Command line
+
+| command | use |
+|---|---|
+| `python -m adamx build [--force] [--verbose]` | Compile the native kernel now instead of on first use. `--force` rebuilds; `--verbose` prints the compiler output. |
+| `python -m adamx info` | Shows the kernel library path, SIMD level, NUMA nodes and L2 cache size. |
+
+### Things to know
+
+* Global gradient clipping (`clip_grad_norm_`) is impossible in asynchronous mode, because
+  the first layers update before the last gradients exist. Use synchronous `step()` if you
+  need it.
+* LR schedulers work in both modes: they change `lr` in the parameter groups, which is read
+  at each update.
+* Master weights are created on a parameter's first update, so loading pretrained weights
+  after building the optimizer is safe.
 
 ## Testing
 
@@ -243,5 +356,3 @@ What has been verified:
   run slower too.
 * Not covered yet: FP16 gradients with `GradScaler`, and integration with DDP or FSDP
   sharding (single-process, one or more GPUs).
-#   a d a m x  
- 
