@@ -5,8 +5,8 @@ import copy
 import pytest
 import torch
 
-import adamx
-from adamx import engine
+import adambridge
+from adambridge import engine
 from conftest import BACKENDS, max_param_diff, tiny_mlp
 
 pytestmark = pytest.mark.cuda
@@ -45,7 +45,7 @@ def test_async_hooks_match_torch_adamw(backend, overlap):
     ref_model = TinyLM().cuda()
     model = copy.deepcopy(ref_model)
     ref = torch.optim.AdamW(ref_model.parameters(), lr=3e-3)
-    opt = adamx.AdamX(model.parameters(), lr=3e-3, backend=backend, overlap_writeback=overlap).attach_hooks(model)
+    opt = adambridge.AdamBridge(model.parameters(), lr=3e-3, backend=backend, overlap_writeback=overlap).attach_hooks(model)
     for step in range(8):
         ref.zero_grad()
         lm_loss(ref_model, step).backward()
@@ -70,7 +70,7 @@ def test_hooked_and_grouped_parameters_match_torch_adamw(threshold):
     ref_model = TinyLM().cuda()
     model = copy.deepcopy(ref_model)
     ref = torch.optim.AdamW(ref_model.parameters(), lr=3e-3)
-    opt = adamx.AdamX(model.parameters(), lr=3e-3, small_param_threshold=threshold).attach_hooks(model)
+    opt = adambridge.AdamBridge(model.parameters(), lr=3e-3, small_param_threshold=threshold).attach_hooks(model)
     sizes = [p.numel() for p in model.parameters()]
     assert threshold != 2000 or (min(sizes) < 2000 <= max(sizes))
     for step in range(6):
@@ -93,8 +93,8 @@ def test_chunked_updates_match_whole_tensor_updates(monkeypatch, backend, precis
         monkeypatch.setattr(engine, "_CHUNK", chunk)
         torch.manual_seed(0)
         model = TinyLM().cuda().to(torch.bfloat16)
-        opt = adamx.AdamX(model.parameters(), lr=3e-3, precision=precision, backend=backend,
-                          small_param_threshold=0).attach_hooks(model)
+        opt = adambridge.AdamBridge(model.parameters(), lr=3e-3, precision=precision, backend=backend,
+                                    small_param_threshold=0).attach_hooks(model)
         for step in range(4):
             lm_loss(model, step).backward()
             assert opt.step_sync().num_updates == len(list(model.parameters()))
@@ -112,7 +112,7 @@ def test_exact_size_pinned_buffers(monkeypatch):
     ref_model = TinyLM().cuda()
     model = copy.deepcopy(ref_model)
     ref = torch.optim.AdamW(ref_model.parameters(), lr=3e-3)
-    opt = adamx.AdamX(model.parameters(), lr=3e-3, small_param_threshold=0).attach_hooks(model)
+    opt = adambridge.AdamBridge(model.parameters(), lr=3e-3, small_param_threshold=0).attach_hooks(model)
     for step in range(4):
         ref.zero_grad()
         lm_loss(ref_model, step).backward()
@@ -130,7 +130,7 @@ def test_small_parameter_without_grad_is_not_updated():
     """A grouped parameter that gets no gradient keeps its value, like torch.optim.AdamW."""
     torch.manual_seed(0)
     model = TinyLM().cuda()
-    opt = adamx.AdamX(model.parameters(), lr=1e-2).attach_hooks(model)
+    opt = adambridge.AdamBridge(model.parameters(), lr=1e-2).attach_hooks(model)
     frozen_bias = model.blocks[0][1].bias
     assert opt._slots[frozen_bias].small is not None   # grouped while it still had requires_grad
     frozen_bias.requires_grad_(False)                   # ... so its group runs the partial path
@@ -152,7 +152,7 @@ def test_sync_step_on_cuda_with_clipping(backend):
     ref_model = TinyLM().cuda()
     model = copy.deepcopy(ref_model)
     ref = torch.optim.AdamW(ref_model.parameters(), lr=3e-3)
-    opt = adamx.AdamX(model.parameters(), lr=3e-3, backend=backend)
+    opt = adambridge.AdamBridge(model.parameters(), lr=3e-3, backend=backend)
     for step in range(5):
         for m, o in ((ref_model, ref), (model, opt)):
             o.zero_grad()
@@ -167,7 +167,7 @@ def test_bf16_params_on_gpu():
     """GPU holds BF16 weights; the host keeps FP32 masters and moments."""
     torch.manual_seed(0)
     model = TinyLM().cuda().to(torch.bfloat16)
-    opt = adamx.AdamX(model.parameters(), lr=3e-3, precision="bf16").attach_hooks(model)
+    opt = adambridge.AdamBridge(model.parameters(), lr=3e-3, precision="bf16").attach_hooks(model)
     losses = []
     for step in range(30):
         loss = lm_loss(model, step % 4)
@@ -189,7 +189,7 @@ def test_gradient_accumulation_with_no_sync():
     ref_model = TinyLM().cuda()
     model = copy.deepcopy(ref_model)
     ref = torch.optim.AdamW(ref_model.parameters(), lr=3e-3)
-    opt = adamx.AdamX(model.parameters(), lr=3e-3).attach_hooks(model)
+    opt = adambridge.AdamBridge(model.parameters(), lr=3e-3).attach_hooks(model)
     for step in range(3):
         ref.zero_grad()
         for micro in range(3):
@@ -210,7 +210,7 @@ def test_weights_visible_to_next_forward_without_host_sync():
     """step_sync orders the write-back on the current stream; no device-wide sync needed."""
     torch.manual_seed(0)
     model = tiny_mlp(device="cuda")
-    opt = adamx.AdamX(model.parameters(), lr=0.5).attach_hooks(model)
+    opt = adambridge.AdamBridge(model.parameters(), lr=0.5).attach_hooks(model)
     x = torch.randn(4, 48, device="cuda")
     model(x).sum().backward()
     opt.step_sync()
@@ -227,9 +227,9 @@ def test_weights_visible_to_next_forward_without_host_sync():
 def test_autotune_runs_and_records_decisions():
     torch.manual_seed(0)
     model = TinyLM().cuda()
-    cfg = adamx.AutoTuneConfig(warmup_steps=1, window=2, threshold=0.0, min_precision="bf16")
+    cfg = adambridge.AutoTuneConfig(warmup_steps=1, window=2, threshold=0.0, min_precision="bf16")
     # Hook every parameter: the backward-time measurement spans the hooked ones.
-    opt = adamx.AdamX(model.parameters(), lr=1e-3, autotune=cfg, small_param_threshold=0).attach_hooks(model)
+    opt = adambridge.AdamBridge(model.parameters(), lr=1e-3, autotune=cfg, small_param_threshold=0).attach_hooks(model)
     for step in range(12):
         lm_loss(model, step).backward()
         stats = opt.step_sync()
@@ -244,7 +244,7 @@ def test_autotune_runs_and_records_decisions():
 def test_mixed_cpu_and_cuda_params():
     gpu = torch.nn.Linear(8, 8).cuda()
     cpu = torch.nn.Linear(8, 8)
-    opt = adamx.AdamX([*gpu.parameters(), *cpu.parameters()], lr=1e-2)
+    opt = adambridge.AdamBridge([*gpu.parameters(), *cpu.parameters()], lr=1e-2)
     before = [p.detach().clone() for p in (*gpu.parameters(), *cpu.parameters())]
     gpu(torch.randn(2, 8, device="cuda")).sum().backward()
     cpu(torch.randn(2, 8)).sum().backward()

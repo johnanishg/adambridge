@@ -1,5 +1,5 @@
 /*
- * adamx native kernels: single-pass fused AdamW update for host-offloaded
+ * adambridge native kernels: single-pass fused AdamW update for host-offloaded
  * optimizer state.
  *
  * Plain C ABI so the library can be built by any C compiler (gcc, clang,
@@ -17,7 +17,7 @@
  * decay applied before the moment step, eps added after bias correction).
  *
  * Moments are stored as FP32, BF16, or FP8 (E4M3 m and E5M2 sqrt(v) with a
- * scale per 128-element block). adamx_multi_step updates many tensors in one
+ * scale per 128-element block). adambridge_multi_step updates many tensors in one
  * call on a persistent native thread pool, so per-tensor cost from Python is
  * a pointer in an array rather than a thread hand-off.
  */
@@ -31,39 +31,39 @@
 #include <math.h>
 
 #if defined(_WIN32)
-#  define ADAMX_API __declspec(dllexport)
+#  define ADAMBRIDGE_API __declspec(dllexport)
 #else
-#  define ADAMX_API __attribute__((visibility("default")))
+#  define ADAMBRIDGE_API __attribute__((visibility("default")))
 #endif
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-#  define ADAMX_X86 1
+#  define ADAMBRIDGE_X86 1
 #  include <immintrin.h>
 #  if defined(_MSC_VER) && !defined(__clang__)
 #    include <intrin.h>
-#    define ADAMX_MSVC 1
-#    define ADAMX_TARGET(isa)
+#    define ADAMBRIDGE_MSVC 1
+#    define ADAMBRIDGE_TARGET(isa)
 #  else
 #    include <cpuid.h>
-#    define ADAMX_TARGET(isa) __attribute__((target(isa)))
+#    define ADAMBRIDGE_TARGET(isa) __attribute__((target(isa)))
 #  endif
 /* clang >= 18 gates 512-bit registers behind a separate "evex512" feature. */
 #  if defined(__clang__) && __clang_major__ >= 18
-#    define ADAMX_AVX512 "avx512f,evex512"
+#    define ADAMBRIDGE_AVX512 "avx512f,evex512"
 #  else
-#    define ADAMX_AVX512 "avx512f"
+#    define ADAMBRIDGE_AVX512 "avx512f"
 #  endif
 #elif defined(__aarch64__) || defined(_M_ARM64)
-#  define ADAMX_NEON 1
+#  define ADAMBRIDGE_NEON 1
 #  include <arm_neon.h>
 #endif
 
-#define ADAMX_ABI_VERSION 3
+#define ADAMBRIDGE_ABI_VERSION 3
 
 enum { DT_NONE = 0, DT_F32 = 1, DT_BF16 = 2, DT_FP8 = 3 };
 enum { SIMD_SCALAR = 0, SIMD_AVX2 = 1, SIMD_AVX512 = 2, SIMD_NEON = 3 };
 
-typedef struct adamx_hparams {
+typedef struct adambridge_hparams {
     float beta1;
     float beta2;
     float one_minus_beta1;
@@ -74,7 +74,7 @@ typedef struct adamx_hparams {
     float eps;
     uint32_t seed;       /* stochastic rounding stream for this (param, step) */
     int32_t stochastic;  /* nonzero: stochastic rounding when storing BF16 moments */
-} adamx_hparams;
+} adambridge_hparams;
 
 /* ------------------------------------------------------------------------- */
 /* Scalar helpers (also used for vector tails, so results do not depend on   */
@@ -121,7 +121,7 @@ static inline const void* cadv(const void* p, int dt, int64_t i) { return (const
 static uint32_t seed_v_of(uint32_t seed) { return hash32(seed ^ 0xA511E9B3U); }
 
 static void fused_scalar(float* p, const void* g, int gt, void* m, void* v, int mvt,
-                         void* out, int ot, int64_t n, uint64_t off, const adamx_hparams* h)
+                         void* out, int ot, int64_t n, uint64_t off, const adambridge_hparams* h)
 {
     const uint32_t s_m = h->seed, s_v = seed_v_of(h->seed);
     for (int64_t i = 0; i < n; ++i) {
@@ -145,9 +145,9 @@ static void fused_scalar(float* p, const void* g, int gt, void* m, void* v, int 
 /* ------------------------------------------------------------------------- */
 /* AVX2 + FMA: 8 lanes                                                       */
 /* ------------------------------------------------------------------------- */
-#if defined(ADAMX_X86)
+#if defined(ADAMBRIDGE_X86)
 
-ADAMX_TARGET("avx2,fma")
+ADAMBRIDGE_TARGET("avx2,fma")
 static inline __m256 avx2_load(const void* base, int dt, int64_t i)
 {
     if (dt == DT_BF16) {
@@ -157,7 +157,7 @@ static inline __m256 avx2_load(const void* base, int dt, int64_t i)
     return _mm256_loadu_ps((const float*)base + i);
 }
 
-ADAMX_TARGET("avx2,fma")
+ADAMBRIDGE_TARGET("avx2,fma")
 static inline __m256i avx2_hash(__m256i x)
 {
     x = _mm256_xor_si256(x, _mm256_srli_epi32(x, 16));
@@ -167,7 +167,7 @@ static inline __m256i avx2_hash(__m256i x)
     return _mm256_xor_si256(x, _mm256_srli_epi32(x, 16));
 }
 
-ADAMX_TARGET("avx2,fma")
+ADAMBRIDGE_TARGET("avx2,fma")
 static inline __m256i avx2_round_rne(__m256 x)
 {
     const __m256i bits = _mm256_castps_si256(x);
@@ -180,7 +180,7 @@ static inline __m256i avx2_round_rne(__m256 x)
 }
 
 /* Take the high 16 bits of 8 x u32 into 8 x u16. */
-ADAMX_TARGET("avx2,fma")
+ADAMBRIDGE_TARGET("avx2,fma")
 static inline __m128i avx2_pack_hi16(__m256i bits)
 {
     __m256i hi = _mm256_srli_epi32(bits, 16);
@@ -189,7 +189,7 @@ static inline __m128i avx2_pack_hi16(__m256i bits)
     return _mm256_castsi256_si128(packed);
 }
 
-ADAMX_TARGET("avx2,fma")
+ADAMBRIDGE_TARGET("avx2,fma")
 static inline void avx2_store_moment(void* base, int dt, int64_t i, __m256 x, int sr, __m256i idx, __m256i seed)
 {
     if (dt == DT_F32) { _mm256_storeu_ps((float*)base + i, x); return; }
@@ -203,9 +203,9 @@ static inline void avx2_store_moment(void* base, int dt, int64_t i, __m256 x, in
     _mm_storeu_si128((__m128i*)((uint16_t*)base + i), avx2_pack_hi16(bits));
 }
 
-ADAMX_TARGET("avx2,fma")
+ADAMBRIDGE_TARGET("avx2,fma")
 static void fused_avx2(float* p, const void* g, int gt, void* m, void* v, int mvt,
-                       void* out, int ot, int64_t n, uint64_t off, const adamx_hparams* h)
+                       void* out, int ot, int64_t n, uint64_t off, const adambridge_hparams* h)
 {
     const __m256 b1 = _mm256_set1_ps(h->beta1), b2 = _mm256_set1_ps(h->beta2);
     const __m256 omb1 = _mm256_set1_ps(h->one_minus_beta1), omb2 = _mm256_set1_ps(h->one_minus_beta2);
@@ -243,7 +243,7 @@ static void fused_avx2(float* p, const void* g, int gt, void* m, void* v, int mv
 /* AVX-512F: 16 lanes                                                        */
 /* ------------------------------------------------------------------------- */
 
-ADAMX_TARGET(ADAMX_AVX512)
+ADAMBRIDGE_TARGET(ADAMBRIDGE_AVX512)
 static inline __m512 avx512_load(const void* base, int dt, int64_t i)
 {
     if (dt == DT_BF16) {
@@ -253,7 +253,7 @@ static inline __m512 avx512_load(const void* base, int dt, int64_t i)
     return _mm512_loadu_ps((const float*)base + i);
 }
 
-ADAMX_TARGET(ADAMX_AVX512)
+ADAMBRIDGE_TARGET(ADAMBRIDGE_AVX512)
 static inline __m512i avx512_hash(__m512i x)
 {
     x = _mm512_xor_si512(x, _mm512_srli_epi32(x, 16));
@@ -263,7 +263,7 @@ static inline __m512i avx512_hash(__m512i x)
     return _mm512_xor_si512(x, _mm512_srli_epi32(x, 16));
 }
 
-ADAMX_TARGET(ADAMX_AVX512)
+ADAMBRIDGE_TARGET(ADAMBRIDGE_AVX512)
 static inline __m512i avx512_round_rne(__m512 x)
 {
     const __m512i bits = _mm512_castps_si512(x);
@@ -273,13 +273,13 @@ static inline __m512i avx512_round_rne(__m512 x)
     return _mm512_mask_mov_epi32(rounded, is_nan, _mm512_or_si512(bits, _mm512_set1_epi32(0x00400000)));
 }
 
-ADAMX_TARGET(ADAMX_AVX512)
+ADAMBRIDGE_TARGET(ADAMBRIDGE_AVX512)
 static inline void avx512_store_bf16(void* base, int64_t i, __m512i bits)
 {
     _mm256_storeu_si256((__m256i*)((uint16_t*)base + i), _mm512_cvtepi32_epi16(_mm512_srli_epi32(bits, 16)));
 }
 
-ADAMX_TARGET(ADAMX_AVX512)
+ADAMBRIDGE_TARGET(ADAMBRIDGE_AVX512)
 static inline void avx512_store_moment(void* base, int dt, int64_t i, __m512 x, int sr, __m512i idx, __m512i seed)
 {
     if (dt == DT_F32) { _mm512_storeu_ps((float*)base + i, x); return; }
@@ -293,9 +293,9 @@ static inline void avx512_store_moment(void* base, int dt, int64_t i, __m512 x, 
     avx512_store_bf16(base, i, bits);
 }
 
-ADAMX_TARGET(ADAMX_AVX512)
+ADAMBRIDGE_TARGET(ADAMBRIDGE_AVX512)
 static void fused_avx512(float* p, const void* g, int gt, void* m, void* v, int mvt,
-                         void* out, int ot, int64_t n, uint64_t off, const adamx_hparams* h)
+                         void* out, int ot, int64_t n, uint64_t off, const adambridge_hparams* h)
 {
     const __m512 b1 = _mm512_set1_ps(h->beta1), b2 = _mm512_set1_ps(h->beta2);
     const __m512 omb1 = _mm512_set1_ps(h->one_minus_beta1), omb2 = _mm512_set1_ps(h->one_minus_beta2);
@@ -331,7 +331,7 @@ static void fused_avx512(float* p, const void* g, int gt, void* m, void* v, int 
 
 static unsigned long long read_xcr0(void)
 {
-#  if defined(ADAMX_MSVC)
+#  if defined(ADAMBRIDGE_MSVC)
     return _xgetbv(0);
 #  else
     unsigned int lo, hi;
@@ -342,7 +342,7 @@ static unsigned long long read_xcr0(void)
 
 static void cpuid_count(unsigned leaf, unsigned sub, unsigned r[4])
 {
-#  if defined(ADAMX_MSVC)
+#  if defined(ADAMBRIDGE_MSVC)
     int x[4];
     __cpuidex(x, (int)leaf, (int)sub);
     r[0] = (unsigned)x[0]; r[1] = (unsigned)x[1]; r[2] = (unsigned)x[2]; r[3] = (unsigned)x[3];
@@ -351,12 +351,12 @@ static void cpuid_count(unsigned leaf, unsigned sub, unsigned r[4])
 #  endif
 }
 
-#endif /* ADAMX_X86 */
+#endif /* ADAMBRIDGE_X86 */
 
 /* ------------------------------------------------------------------------- */
 /* NEON (AArch64): 4 lanes                                                   */
 /* ------------------------------------------------------------------------- */
-#if defined(ADAMX_NEON)
+#if defined(ADAMBRIDGE_NEON)
 
 static inline float32x4_t neon_load(const void* base, int dt, int64_t i)
 {
@@ -392,7 +392,7 @@ static inline void neon_store_moment(void* base, int dt, int64_t i, float32x4_t 
 }
 
 static void fused_neon(float* p, const void* g, int gt, void* m, void* v, int mvt,
-                       void* out, int ot, int64_t n, uint64_t off, const adamx_hparams* h)
+                       void* out, int ot, int64_t n, uint64_t off, const adambridge_hparams* h)
 {
     const float32x4_t b1 = vdupq_n_f32(h->beta1), b2 = vdupq_n_f32(h->beta2);
     const float32x4_t omb1 = vdupq_n_f32(h->one_minus_beta1), omb2 = vdupq_n_f32(h->one_minus_beta2);
@@ -427,7 +427,7 @@ static void fused_neon(float* p, const void* g, int gt, void* m, void* v, int mv
                      adv(out, ot, i), ot, n - i, off + (uint64_t)i, h);
 }
 
-#endif /* ADAMX_NEON */
+#endif /* ADAMBRIDGE_NEON */
 
 /* ------------------------------------------------------------------------- */
 /* Threads, locks, atomics                                                   */
@@ -465,7 +465,7 @@ static void ax_cond_broadcast(ax_cond* c) { pthread_cond_broadcast(c); }
 static void ax_yield(void) { sched_yield(); }
 #endif
 
-#if defined(ADAMX_MSVC)
+#if defined(ADAMBRIDGE_MSVC)
 static int32_t ax_load(volatile int32_t* p) { return (int32_t)InterlockedCompareExchange((volatile LONG*)p, 0, 0); }
 static void ax_store(volatile int32_t* p, int32_t v) { InterlockedExchange((volatile LONG*)p, (LONG)v); }
 static int32_t ax_fetch_add(volatile int32_t* p, int32_t v) { return (int32_t)InterlockedExchangeAdd((volatile LONG*)p, (LONG)v); }
@@ -481,7 +481,7 @@ static inline void ax_store64(volatile int64_t* p, int64_t v) { __atomic_store_n
 
 static inline void ax_relax(void)
 {
-#if defined(ADAMX_X86)
+#if defined(ADAMBRIDGE_X86)
     _mm_pause();
 #elif defined(__aarch64__) && !defined(_MSC_VER)
     __asm__ __volatile__("yield");
@@ -500,7 +500,7 @@ static inline void ax_relax(void)
 
 static int detect_simd(void)
 {
-#if defined(ADAMX_X86)
+#if defined(ADAMBRIDGE_X86)
     unsigned r[4];
     cpuid_count(0, 0, r);
     if (r[0] < 7) return SIMD_SCALAR;
@@ -515,7 +515,7 @@ static int detect_simd(void)
     if (((ebx >> 16) & 1) && (xcr0 & 0xe6) == 0xe6) return SIMD_AVX512; /* + opmask/ZMM */
     if ((ebx >> 5) & 1) return SIMD_AVX2;
     return SIMD_SCALAR;
-#elif defined(ADAMX_NEON)
+#elif defined(ADAMBRIDGE_NEON)
     return SIMD_NEON;
 #else
     return SIMD_SCALAR;
@@ -538,14 +538,14 @@ static void ensure_init(void)
 }
 
 static void fused_dispatch(float* p, const void* g, int gt, void* m, void* v, int mvt,
-                           void* out, int ot, int64_t n, uint64_t off, const adamx_hparams* h)
+                           void* out, int ot, int64_t n, uint64_t off, const adambridge_hparams* h)
 {
     switch (g_active) {
-#if defined(ADAMX_X86)
+#if defined(ADAMBRIDGE_X86)
     case SIMD_AVX512: fused_avx512(p, g, gt, m, v, mvt, out, ot, n, off, h); break;
     case SIMD_AVX2:   fused_avx2(p, g, gt, m, v, mvt, out, ot, n, off, h); break;
 #endif
-#if defined(ADAMX_NEON)
+#if defined(ADAMBRIDGE_NEON)
     case SIMD_NEON:   fused_neon(p, g, gt, m, v, mvt, out, ot, n, off, h); break;
 #endif
     default:          fused_scalar(p, g, gt, m, v, mvt, out, ot, n, off, h); break;
@@ -556,7 +556,7 @@ static void fused_dispatch(float* p, const void* g, int gt, void* m, void* v, in
 /* Segments: one tensor's buffers plus its parameter group                   */
 /* ------------------------------------------------------------------------- */
 
-typedef struct adamx_group {
+typedef struct adambridge_group {
     double lr;
     double beta1;
     double beta2;
@@ -565,9 +565,9 @@ typedef struct adamx_group {
     uint64_t seed;       /* base seed for stochastic rounding */
     int32_t stochastic;
     int32_t reserved;
-} adamx_group;
+} adambridge_group;
 
-typedef struct adamx_segment {
+typedef struct adambridge_segment {
     float* p;                /* FP32 master weights */
     const void* g;           /* gradient (g_dtype) */
     void* m;                 /* first moment (mv_dtype; FP8: E4M3 codes) */
@@ -575,7 +575,7 @@ typedef struct adamx_segment {
     float* m_scale;          /* FP8 only: one scale per 128 elements */
     float* v_scale;
     void* out;               /* optional copy of p in out_dtype (write-back buffer) */
-    const adamx_group* group;
+    const adambridge_group* group;
     int64_t n;
     int64_t step;            /* step number of this update (caller increments) */
     uint64_t index;          /* parameter index, selects the rounding stream */
@@ -586,9 +586,9 @@ typedef struct adamx_segment {
     int32_t mv_dtype;
     int32_t out_dtype;
     int32_t reserved;
-} adamx_segment;
+} adambridge_segment;
 
-/* Same mixing as adamx.kernels.mix_seed(seed, index, step). */
+/* Same mixing as adambridge.kernels.mix_seed(seed, index, step). */
 static uint64_t mix64(uint64_t h, uint64_t v)
 {
     h = (h ^ v) * 0xBF58476D1CE4E5B9ULL;
@@ -607,10 +607,10 @@ static uint32_t step_seed(uint64_t base, uint64_t index, int64_t step)
     return (uint32_t)h;
 }
 
-/* The per-step scalars, computed in double like adamx.kernels.StepCoefficients. */
-static void hparams_for(const adamx_segment* s, adamx_hparams* h)
+/* The per-step scalars, computed in double like adambridge.kernels.StepCoefficients. */
+static void hparams_for(const adambridge_segment* s, adambridge_hparams* h)
 {
-    const adamx_group* G = s->group;
+    const adambridge_group* G = s->group;
     const double t = (double)s->step;
     const double bc1 = 1.0 - pow(G->beta1, t);
     const double bc2 = 1.0 - pow(G->beta2, t);
@@ -632,7 +632,7 @@ static void hparams_for(const adamx_segment* s, adamx_hparams* h)
 /* m is stored as E4M3 (the "fn" variant: no infinities, max 448) and        */
 /* sqrt(v) as E5M2 (max 57344), each with one FP32 scale per 128-element     */
 /* block: scale = block absmax / format max. Layout, arithmetic and the      */
-/* stochastic-rounding stream match adamx.precision.FP8Store, so this        */
+/* stochastic-rounding stream match adambridge.precision.FP8Store, so this        */
 /* kernel and the PyTorch one make the same rounding decisions.              */
 /* ------------------------------------------------------------------------- */
 
@@ -668,7 +668,7 @@ static void build_fp8_luts(void)
     }
 }
 
-/* fp32 -> FP8 code, exactly as adamx.precision does it: optional stochastic
+/* fp32 -> FP8 code, exactly as adambridge.precision does it: optional stochastic
  * truncation of the fp32 bits to the format's mantissa width, clamp to the
  * format max, then round-to-nearest-even into the format. Branch-free so the
  * per-block loops vectorize. */
@@ -733,32 +733,32 @@ static inline uint32_t fp8_encode(float x, int sr, uint32_t r, int mbits, int bi
     }                                                                                            \
 }
 
-static void fp8_range_scalar(const adamx_segment* s, const adamx_hparams* h, int64_t lo, int64_t hi)
+static void fp8_range_scalar(const adambridge_segment* s, const adambridge_hparams* h, int64_t lo, int64_t hi)
 FP8_RANGE_BODY(fused_scalar)
 
-#if defined(ADAMX_X86)
-ADAMX_TARGET("avx2,fma")
-static void fp8_range_avx2(const adamx_segment* s, const adamx_hparams* h, int64_t lo, int64_t hi)
+#if defined(ADAMBRIDGE_X86)
+ADAMBRIDGE_TARGET("avx2,fma")
+static void fp8_range_avx2(const adambridge_segment* s, const adambridge_hparams* h, int64_t lo, int64_t hi)
 FP8_RANGE_BODY(fused_avx2)
 
-ADAMX_TARGET(ADAMX_AVX512)
-static void fp8_range_avx512(const adamx_segment* s, const adamx_hparams* h, int64_t lo, int64_t hi)
+ADAMBRIDGE_TARGET(ADAMBRIDGE_AVX512)
+static void fp8_range_avx512(const adambridge_segment* s, const adambridge_hparams* h, int64_t lo, int64_t hi)
 FP8_RANGE_BODY(fused_avx512)
 #endif
 
-#if defined(ADAMX_NEON)
-static void fp8_range_neon(const adamx_segment* s, const adamx_hparams* h, int64_t lo, int64_t hi)
+#if defined(ADAMBRIDGE_NEON)
+static void fp8_range_neon(const adambridge_segment* s, const adambridge_hparams* h, int64_t lo, int64_t hi)
 FP8_RANGE_BODY(fused_neon)
 #endif
 
-static void fp8_dispatch(const adamx_segment* s, const adamx_hparams* h, int64_t lo, int64_t hi)
+static void fp8_dispatch(const adambridge_segment* s, const adambridge_hparams* h, int64_t lo, int64_t hi)
 {
     switch (g_active) {
-#if defined(ADAMX_X86)
+#if defined(ADAMBRIDGE_X86)
     case SIMD_AVX512: fp8_range_avx512(s, h, lo, hi); break;
     case SIMD_AVX2:   fp8_range_avx2(s, h, lo, hi); break;
 #endif
-#if defined(ADAMX_NEON)
+#if defined(ADAMBRIDGE_NEON)
     case SIMD_NEON:   fp8_range_neon(s, h, lo, hi); break;
 #endif
     default:          fp8_range_scalar(s, h, lo, hi); break;
@@ -770,8 +770,8 @@ static void fp8_dispatch(const adamx_segment* s, const adamx_hparams* h, int64_t
 /* ------------------------------------------------------------------------- */
 
 typedef struct ax_item {
-    const adamx_segment* seg;
-    const adamx_hparams* h;
+    const adambridge_segment* seg;
+    const adambridge_hparams* h;
     int64_t lo;
     int64_t hi;
 } ax_item;
@@ -783,7 +783,7 @@ typedef struct ax_job {
 
 static void run_item(const ax_item* it)
 {
-    const adamx_segment* s = it->seg;
+    const adambridge_segment* s = it->seg;
     const int64_t lo = it->lo;
     if (s->mv_dtype == DT_FP8) {
         fp8_dispatch(s, it->h, lo, it->hi);
@@ -794,16 +794,16 @@ static void run_item(const ax_item* it)
                    adv(s->out, s->out_dtype, lo), s->out_dtype, it->hi - lo, (uint64_t)(s->offset + lo), it->h);
 }
 
-typedef struct adamx_pool adamx_pool;
+typedef struct adambridge_pool adambridge_pool;
 
 typedef struct ax_helper {
-    adamx_pool* pool;
+    adambridge_pool* pool;
     int32_t id;              /* 1 .. nthreads-1; the calling thread is 0 */
     ax_lock lock;            /* each helper sleeps on its own cv, so a job */
     ax_cond cv;              /* wakes only the helpers it needs */
 } ax_helper;
 
-struct adamx_pool {
+struct adambridge_pool {
     int32_t nthreads;        /* helpers + the calling thread */
     ax_thread* threads;
     ax_helper* helpers;
@@ -819,7 +819,7 @@ struct adamx_pool {
     const ax_job* job;
 };
 
-static void pool_work(adamx_pool* P, const ax_job* job)
+static void pool_work(adambridge_pool* P, const ax_job* job)
 {
     for (;;) {
         const int32_t i = ax_fetch_add(&P->next, 1);
@@ -828,7 +828,7 @@ static void pool_work(adamx_pool* P, const ax_job* job)
     }
 }
 
-static void pin_current_thread(const adamx_pool* P)
+static void pin_current_thread(const adambridge_pool* P)
 {
     if (P->ncpus <= 0) return;
 #if defined(__linux__)
@@ -852,7 +852,7 @@ static inline int wanted(const ax_helper* me, int64_t t) { return me->id <= (int
 
 static void helper_main(ax_helper* me)
 {
-    adamx_pool* P = me->pool;
+    adambridge_pool* P = me->pool;
     pin_current_thread(P);
     /* The ticket the pool was created with (no job yet), not the current one: a
      * job posted before this thread got to run must still be seen as new. */
@@ -885,7 +885,7 @@ static DWORD WINAPI helper_entry(LPVOID arg) { helper_main((ax_helper*)arg); ret
 static void* helper_entry(void* arg) { helper_main((ax_helper*)arg); return NULL; }
 #endif
 
-static void pool_run(adamx_pool* P, const ax_job* job, int32_t threads)
+static void pool_run(adambridge_pool* P, const ax_job* job, int32_t threads)
 {
     if (!P || threads <= 1 || job->nitems <= 1 || P->nthreads <= 1) {
         for (int32_t i = 0; i < job->nitems; ++i) run_item(&job->items[i]);
@@ -916,11 +916,11 @@ static void pool_run(adamx_pool* P, const ax_job* job, int32_t threads)
 
 /* Threads that update segments: `nthreads` includes the calling thread, so
  * nthreads - 1 helpers are started. cpus (may be NULL) pins the helpers. */
-ADAMX_API void* adamx_pool_create(int32_t nthreads, const int32_t* cpus, int32_t ncpus)
+ADAMBRIDGE_API void* adambridge_pool_create(int32_t nthreads, const int32_t* cpus, int32_t ncpus)
 {
     ensure_init();
     if (nthreads < 1) nthreads = 1;
-    adamx_pool* P = (adamx_pool*)calloc(1, sizeof(adamx_pool));
+    adambridge_pool* P = (adambridge_pool*)calloc(1, sizeof(adambridge_pool));
     if (!P) return NULL;
     P->nthreads = nthreads;
     P->spin = 4000;
@@ -949,9 +949,9 @@ ADAMX_API void* adamx_pool_create(int32_t nthreads, const int32_t* cpus, int32_t
     return P;
 }
 
-ADAMX_API void adamx_pool_destroy(void* pool)
+ADAMBRIDGE_API void adambridge_pool_destroy(void* pool)
 {
-    adamx_pool* P = (adamx_pool*)pool;
+    adambridge_pool* P = (adambridge_pool*)pool;
     if (!P) return;
     ax_store(&P->stop, 1);
     for (int32_t i = 0; i < P->nthreads - 1; ++i) {
@@ -973,25 +973,25 @@ ADAMX_API void adamx_pool_destroy(void* pool)
     free(P);
 }
 
-ADAMX_API int32_t adamx_pool_threads(void* pool) { return pool ? ((adamx_pool*)pool)->nthreads : 1; }
+ADAMBRIDGE_API int32_t adambridge_pool_threads(void* pool) { return pool ? ((adambridge_pool*)pool)->nthreads : 1; }
 
 /* How long helpers spin (in pause instructions) before sleeping between jobs. */
-ADAMX_API void adamx_pool_set_spin(void* pool, int32_t spin) { if (pool) ((adamx_pool*)pool)->spin = spin < 0 ? 0 : spin; }
+ADAMBRIDGE_API void adambridge_pool_set_spin(void* pool, int32_t spin) { if (pool) ((adambridge_pool*)pool)->spin = spin < 0 ? 0 : spin; }
 
 /* ------------------------------------------------------------------------- */
 /* Public entry points                                                       */
 /* ------------------------------------------------------------------------- */
 
-ADAMX_API int adamx_abi_version(void) { return ADAMX_ABI_VERSION; }
+ADAMBRIDGE_API int adambridge_abi_version(void) { return ADAMBRIDGE_ABI_VERSION; }
 
-ADAMX_API int adamx_detected_simd_level(void) { ensure_init(); return g_detected; }
+ADAMBRIDGE_API int adambridge_detected_simd_level(void) { ensure_init(); return g_detected; }
 
-ADAMX_API int adamx_simd_level(void) { ensure_init(); return g_active; }
+ADAMBRIDGE_API int adambridge_simd_level(void) { ensure_init(); return g_active; }
 
 /* Restrict the active ISA (e.g. to benchmark or test the scalar path).
  * A level the CPU does not support falls back to the detected one.
  * Returns the level now active. */
-ADAMX_API int adamx_set_simd_level(int level)
+ADAMBRIDGE_API int adambridge_set_simd_level(int level)
 {
     ensure_init();
     if (level < 0) g_active = g_detected;
@@ -1001,16 +1001,16 @@ ADAMX_API int adamx_set_simd_level(int level)
     return g_active;
 }
 
-ADAMX_API int adamx_hparams_size(void) { return (int)sizeof(adamx_hparams); }
-ADAMX_API int adamx_group_size(void) { return (int)sizeof(adamx_group); }
-ADAMX_API int adamx_segment_size(void) { return (int)sizeof(adamx_segment); }
+ADAMBRIDGE_API int adambridge_hparams_size(void) { return (int)sizeof(adambridge_hparams); }
+ADAMBRIDGE_API int adambridge_group_size(void) { return (int)sizeof(adambridge_group); }
+ADAMBRIDGE_API int adambridge_segment_size(void) { return (int)sizeof(adambridge_segment); }
 
 /* Returns 0 on success, negative on invalid arguments. Single-threaded,
  * FP32/BF16 moments only (kept for tests and simple callers). */
-ADAMX_API int adamx_fused_adamw(float* p, const void* g, int g_dtype,
-                                void* m, void* v, int mv_dtype,
-                                void* out, int out_dtype,
-                                int64_t n, uint64_t offset, const adamx_hparams* hp)
+ADAMBRIDGE_API int adambridge_fused_adamw(float* p, const void* g, int g_dtype,
+                                          void* m, void* v, int mv_dtype,
+                                          void* out, int out_dtype,
+                                          int64_t n, uint64_t offset, const adambridge_hparams* hp)
 {
     if (n < 0 || !hp) return -1;
     if (n == 0) return 0;
@@ -1026,7 +1026,7 @@ ADAMX_API int adamx_fused_adamw(float* p, const void* g, int g_dtype,
     return 0;
 }
 
-static int check_segment(const adamx_segment* s, int need_group)
+static int check_segment(const adambridge_segment* s, int need_group)
 {
     if (!s || s->n < 0) return -1;
     if (s->n == 0) return 0;
@@ -1046,7 +1046,7 @@ static int check_segment(const adamx_segment* s, int need_group)
  * FP8 block; also keeps the SIMD/tail split independent of the thread count). */
 #define AX_MIN_PIECE 32768
 
-static int run_segments(adamx_pool* P, adamx_segment* const* segs, const adamx_hparams* hps,
+static int run_segments(adambridge_pool* P, adambridge_segment* const* segs, const adambridge_hparams* hps,
                         int32_t nsegs, int32_t threads)
 {
     if (threads <= 0) threads = P ? P->nthreads : 1;
@@ -1089,7 +1089,7 @@ static int run_segments(adamx_pool* P, adamx_segment* const* segs, const adamx_h
  * and its step field, which the caller sets to this update's step number.
  * Validates every segment first; on error nothing is updated and the
  * negative code of the first bad segment is returned. */
-ADAMX_API int adamx_multi_step(void* pool, adamx_segment* const* segs, int32_t nsegs, int32_t threads)
+ADAMBRIDGE_API int adambridge_multi_step(void* pool, adambridge_segment* const* segs, int32_t nsegs, int32_t threads)
 {
     if (nsegs <= 0) return 0;
     if (!segs) return -1;
@@ -1098,18 +1098,18 @@ ADAMX_API int adamx_multi_step(void* pool, adamx_segment* const* segs, int32_t n
         const int rc = check_segment(segs[i], 1);
         if (rc) return rc;
     }
-    adamx_hparams* hps = (adamx_hparams*)malloc(sizeof(adamx_hparams) * (size_t)nsegs);
+    adambridge_hparams* hps = (adambridge_hparams*)malloc(sizeof(adambridge_hparams) * (size_t)nsegs);
     if (!hps) return -10;
     for (int32_t i = 0; i < nsegs; ++i) hparams_for(segs[i], &hps[i]);
-    const int rc = run_segments((adamx_pool*)pool, segs, hps, nsegs, threads);
+    const int rc = run_segments((adambridge_pool*)pool, segs, hps, nsegs, threads);
     free(hps);
     return rc;
 }
 
-/* Same as adamx_multi_step with caller-supplied coefficients (hps[i] for
+/* Same as adambridge_multi_step with caller-supplied coefficients (hps[i] for
  * segs[i]); groups and steps are ignored. Used by tests and benchmarks. */
-ADAMX_API int adamx_multi_apply(void* pool, adamx_segment* const* segs, const adamx_hparams* hps,
-                                int32_t nsegs, int32_t threads)
+ADAMBRIDGE_API int adambridge_multi_apply(void* pool, adambridge_segment* const* segs, const adambridge_hparams* hps,
+                                          int32_t nsegs, int32_t threads)
 {
     if (nsegs <= 0) return 0;
     if (!segs || !hps) return -1;
@@ -1118,5 +1118,5 @@ ADAMX_API int adamx_multi_apply(void* pool, adamx_segment* const* segs, const ad
         const int rc = check_segment(segs[i], 0);
         if (rc) return rc;
     }
-    return run_segments((adamx_pool*)pool, segs, hps, nsegs, threads);
+    return run_segments((adambridge_pool*)pool, segs, hps, nsegs, threads);
 }

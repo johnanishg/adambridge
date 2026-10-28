@@ -3,7 +3,7 @@ import sys
 import pytest
 import torch
 
-from adamx import hardware
+from adambridge import hardware
 
 
 def test_parse_cpulist():

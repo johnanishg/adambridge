@@ -1,8 +1,8 @@
 import pytest
 import torch
 
-from adamx import precision as P
-from adamx.kernels import mix_seed
+from adambridge import precision as P
+from adambridge.kernels import mix_seed
 
 
 def test_aliases_and_bytes():

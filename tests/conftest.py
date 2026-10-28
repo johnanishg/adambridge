@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from adamx import native
+from adambridge import native
 
 CUDA = torch.cuda.is_available()
 NATIVE = native.load() is not None

@@ -1,4 +1,4 @@
-"""End-to-end training step: GPU AdamW vs adamx (synchronous) vs adamx (layer-wise async).
+"""End-to-end training step: GPU AdamW vs adambridge (synchronous) vs adambridge (layer-wise async).
 
     python benchmarks/bench_pipeline.py --dim 2048 --layers 24 --tokens 8192
 
@@ -16,7 +16,7 @@ import time
 
 import torch
 
-import adamx
+import adambridge
 
 
 class Block(torch.nn.Module):
@@ -62,13 +62,13 @@ def main():
     ap.add_argument("--tokens", type=int, default=8192)
     ap.add_argument("--steps", type=int, default=6)
     ap.add_argument("--warmup", type=int, default=3)
-    ap.add_argument("--precision", default="fp32", help="adamx moment precision")
+    ap.add_argument("--precision", default="fp32", help="adambridge moment precision")
     ap.add_argument("--threads", type=int, default=None)
     args = ap.parse_args()
 
     n = sum(p.numel() for p in make_model(args.dim, 1, torch.float32).parameters()) * args.layers
     gc.collect()
-    print(f"{n / 1e6:.0f}M params, {args.tokens} tokens/step, adamx moments={args.precision}")
+    print(f"{n / 1e6:.0f}M params, {args.tokens} tokens/step, adambridge moments={args.precision}")
     print(f"{'configuration':<44}{'step':>12}{'peak GPU':>13}")
 
     # Floor: forward + backward in BF16, no optimizer.
@@ -105,7 +105,7 @@ def main():
 
     for mode in ("sync", "async"):
         model = make_model(args.dim, args.layers, torch.bfloat16)
-        opt = adamx.AdamX(model.parameters(), lr=1e-4, precision=args.precision, num_threads=args.threads)
+        opt = adambridge.AdamBridge(model.parameters(), lr=1e-4, precision=args.precision, num_threads=args.threads)
         if mode == "async":
             opt.attach_hooks(model)
 
@@ -119,7 +119,7 @@ def main():
                 opt.step()
                 opt.zero_grad(set_to_none=True)
 
-        label = f"adamx {mode:<5} ({opt.backend}, bf16 params)"
+        label = f"adambridge {mode:<5} ({opt.backend}, bf16 params)"
         run(label, model, step, x, args.steps, args.warmup)
         s = opt.last_step_stats
         print(f"{'':<4}host kernel time {s.cpu_update * 1e3:.0f} ms, step_sync stall {s.stall * 1e3:.0f} ms, "

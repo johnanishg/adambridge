@@ -63,7 +63,7 @@ from .precision import FP8_BLOCK, MomentStore, make_store
 
 __all__ = ["UpdateEngine", "ParamSlot", "SmallGroup", "StepStats"]
 
-log = logging.getLogger("adamx")
+log = logging.getLogger("adambridge")
 
 # Ranges handed to threads start on this boundary: a multiple of the SIMD
 # width (so vector/tail assignment is independent of the split) and of the
@@ -225,7 +225,7 @@ class _ComputePool:
         self.handle = kernels.create_pool(num_threads, cpus) if kernels is not None else None
         self._executor = ThreadPoolExecutor(
             max_workers=1,
-            thread_name_prefix=f"adamx-{name}",
+            thread_name_prefix=f"adambridge-{name}",
             initializer=hardware.pin_current_thread if cpus else None,
             initargs=(cpus,) if cpus else (),
         )
@@ -274,7 +274,7 @@ class _DeviceWorker:
             self.d2h_stream = torch.cuda.Stream(device)
             self.h2d_stream = torch.cuda.Stream(device)
         self.busy = 0.0
-        self.thread = threading.Thread(target=self._run, name=f"adamx-worker-{device}", daemon=True)
+        self.thread = threading.Thread(target=self._run, name=f"adambridge-worker-{device}", daemon=True)
         self.thread.start()
 
     def _run(self) -> None:
@@ -764,7 +764,7 @@ class UpdateEngine:
                 self._cv.wait()
         if self._errors:
             errors, self._errors = self._errors, []
-            raise RuntimeError(f"adamx host update failed ({len(errors)} error(s))") from errors[0]
+            raise RuntimeError(f"adambridge host update failed ({len(errors)} error(s))") from errors[0]
 
     def finish_step(self) -> StepStats:
         """Wait for host updates, order write-backs before the caller's next GPU work."""

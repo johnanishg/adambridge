@@ -4,7 +4,7 @@ Two implementations share one contract: update ``[lo, hi)`` of the FP32
 master weights and both moment stores in place, optionally writing the new
 weights (cast to the accelerator dtype) into ``out``.
 
-* :mod:`adamx.native` - single-pass SIMD kernel (FP32/BF16 moments).
+* :mod:`adambridge.native` - single-pass SIMD kernel (FP32/BF16 moments).
 * :func:`fused_adamw_chunk` - PyTorch ops over one chunk at a time. Each op
   is a separate pass, but over a chunk that fits in the cores' combined L2
   (ATen splits every op over its intra-op threads the same way, so each

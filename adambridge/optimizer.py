@@ -1,4 +1,4 @@
-"""AdamX: AdamW with optimizer state offloaded to host memory and updated by
+"""AdamBridge: AdamW with optimizer state offloaded to host memory and updated by
 SIMD kernels on the CPU, overlapped with the GPU backward pass."""
 
 from __future__ import annotations
@@ -14,12 +14,12 @@ from . import autotune as _autotune
 from .engine import ParamSlot, SmallGroup, StepStats, UpdateEngine
 from .precision import bytes_per_param, canonical_precision, make_store, store_from_state_dict
 
-__all__ = ["AdamX", "OptiComputeAdamW"]
+__all__ = ["AdamBridge", "OptiComputeAdamW"]
 
-log = logging.getLogger("adamx")
+log = logging.getLogger("adambridge")
 
 
-class AdamX(torch.optim.Optimizer):
+class AdamBridge(torch.optim.Optimizer):
     r"""AdamW whose state lives in (NUMA-local) host memory.
 
     Numerically this is ``torch.optim.AdamW`` (decoupled weight decay, bias
@@ -70,7 +70,7 @@ class AdamX(torch.optim.Optimizer):
             it off if some op reads a parameter during backward *after* that
             parameter's gradient is complete (only possible via ``.detach()``
             tricks).
-        autotune: ``True`` or an :class:`~adamx.autotune.AutoTuneConfig` to
+        autotune: ``True`` or an :class:`~adambridge.autotune.AutoTuneConfig` to
             tune thread count and moment precision at runtime.
         seed: base seed for stochastic rounding.
         small_param_threshold: CUDA parameters with fewer elements (norms,
@@ -147,7 +147,7 @@ class AdamX(torch.optim.Optimizer):
         group = self.param_groups[-1]
         for p in group["params"]:
             if p.is_sparse:
-                raise ValueError("AdamX does not support sparse parameters")
+                raise ValueError("AdamBridge does not support sparse parameters")
             slot = ParamSlot(len(self._ordered), p, group)
             self._slots[p] = slot
             self._ordered.append(slot)
@@ -170,7 +170,7 @@ class AdamX(torch.optim.Optimizer):
 
     # ------------------------------------------------------------ async mode
 
-    def attach_hooks(self, model: torch.nn.Module | None = None) -> "AdamX":
+    def attach_hooks(self, model: torch.nn.Module | None = None) -> "AdamBridge":
         """Start updating each parameter as soon as its gradient is ready.
 
         If ``model`` is given, only its parameters are hooked.
@@ -210,11 +210,11 @@ class AdamX(torch.optim.Optimizer):
     def _submit(self, slot: ParamSlot, grad: torch.Tensor) -> None:
         if slot.submitted:
             raise RuntimeError(
-                "AdamX: parameter received a second gradient before step_sync(); "
+                "AdamBridge: parameter received a second gradient before step_sync(); "
                 "run extra backward passes inside optimizer.no_sync() to accumulate gradients"
             )
         if grad.is_sparse:
-            raise RuntimeError("AdamX does not support sparse gradients")
+            raise RuntimeError("AdamBridge does not support sparse gradients")
         slot.submitted = True
         self._engine.submit(slot, grad)
 
@@ -342,11 +342,11 @@ class AdamX(torch.optim.Optimizer):
             for slot in self._ordered
             if slot.initialized
         }
-        sd["adamx"] = {"precision": self.precision, "format": 1}
+        sd["adambridge"] = {"precision": self.precision, "format": 1}
         return sd
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        """Load an AdamX checkpoint, or a ``torch.optim.AdamW`` one (moments are
+        """Load an AdamBridge checkpoint, or a ``torch.optim.AdamW`` one (moments are
         converted to this optimizer's precision)."""
         self._engine.wait()
         saved = state_dict["state"]
@@ -376,4 +376,4 @@ class AdamX(torch.optim.Optimizer):
         self._finalizer()
 
 
-OptiComputeAdamW = AdamX
+OptiComputeAdamW = AdamBridge

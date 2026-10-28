@@ -1,4 +1,4 @@
-# adamx
+# adambridge
 
 AdamW for PyTorch with the optimizer state offloaded to host RAM and updated by
 fused SIMD kernels on the CPU. It overlaps those updates with the GPU backward
@@ -7,11 +7,11 @@ keeps only the parameters, while FP32 master weights and both Adam moments
 live on the (NUMA-local) host.
 
 ```python
-import adamx
+import adambridge
 
-opt = adamx.AdamX(model.parameters(), lr=1e-4, weight_decay=0.01,
-                  precision="bf16_moments")   # 'fp32' | 'bf16' | 'fp8'
-opt.attach_hooks(model)                       # layer-wise async updates
+opt = adambridge.AdamBridge(model.parameters(), lr=1e-4, weight_decay=0.01,
+                            precision="bf16_moments")   # 'fp32' | 'bf16' | 'fp8'
+opt.attach_hooks(model)                                 # layer-wise async updates
 
 for x, y in loader:
     loss = loss_fn(model(x), y)
@@ -19,15 +19,15 @@ for x, y in loader:
     opt.step_sync()     # wait; the next forward pass sees the new weights
 ```
 
-Without `attach_hooks`, `AdamX` is a drop-in optimizer (`backward(); step(); zero_grad()`),
-and works with LR schedulers and `clip_grad_norm_`. `adamx.OptiComputeAdamW` is an alias.
+Without `attach_hooks`, `AdamBridge` is a drop-in optimizer (`backward(); step(); zero_grad()`),
+and works with LR schedulers and `clip_grad_norm_`. `adambridge.OptiComputeAdamW` is an alias.
 
 ## Measured results
 
-All numbers in this section come from two `adamx-lab` reports generated on 2026-10-28
-(`adamx-lab/reports/20261028-224442-*`). Test machine: a laptop with an NVIDIA GeForce
+All numbers in this section come from two `adambridge-lab` reports generated on 2026-10-28
+(`adambridge-lab/reports/20261028-224442-*`). Test machine: a laptop with an NVIDIA GeForce
 RTX 5090 Laptop GPU (24 GiB VRAM), Intel Core Ultra 9 290HX Plus (24 threads, AVX2), 64 GiB RAM,
-Windows 11, Python 3.14.7, PyTorch 2.14.1 + CUDA 13.2, adamx 0.1.0 (native/avx2 backend).
+Windows 11, Python 3.14.7, PyTorch 2.14.1 + CUDA 13.2, adambridge 0.1.0 (native/avx2 backend).
 Compared libraries: bitsandbytes 0.50.2, torchao 0.18.0; DeepSpeed 0.19.8 (CPU kernel only,
 under WSL, because it is not installed on Windows).
 
@@ -36,16 +36,16 @@ under WSL, because it is not installed on Windows).
 Qwen2.5-0.5B (494M parameters) fine-tuned on WikiText-2: 200 steps of 8 × 512 tokens,
 peak learning rate 2e-5 with warm-up and cosine decay. Every configuration starts from
 the same weights, sees the same batches in the same order, and runs in a fresh process
-(the *LLM fine-tuning* experiment in `adamx-lab`). Validation loss is measured on the
+(the *LLM fine-tuning* experiment in `adambridge-lab`). Validation loss is measured on the
 whole WikiText-2 validation split (start: 2.868).
 
 | configuration | final val. loss | Δ vs reference | step | peak GPU | host RAM† |
 |---|---:|---:|---:|---:|---:|
 | PyTorch AdamW, FP32 weights + autocast (**reference**) | 2.6402 | | 292 ms | 19.6 GiB | |
 | PyTorch AdamW, BF16 weights + FP32 master, all on GPU | 2.6404 | +0.0002 | 281 ms | 18.8 GiB | <0.1 GiB |
-| **adamx, FP32 moments** | 2.6409 | +0.0008 | 395 ms | 13.2 GiB | +7.4 GiB |
-| **adamx, BF16 moments** | 2.6405 | +0.0003 | 317 ms | 13.2 GiB | +5.6 GiB |
-| **adamx, FP8 moments** | 2.6409 | +0.0007 | 305 ms | 13.2 GiB | +4.7 GiB |
+| **adambridge, FP32 moments** | 2.6409 | +0.0008 | 395 ms | 13.2 GiB | +7.4 GiB |
+| **adambridge, BF16 moments** | 2.6405 | +0.0003 | 317 ms | 13.2 GiB | +5.6 GiB |
+| **adambridge, FP8 moments** | 2.6409 | +0.0007 | 305 ms | 13.2 GiB | +4.7 GiB |
 | bitsandbytes AdamW8bit, FP32 weights | 2.6433 | +0.0031 | 312 ms | 16.8 GiB | <0.1 GiB |
 | bitsandbytes AdamW8bit, BF16 weights | 2.6557 | +0.0156 | 298 ms | 14.2 GiB | <0.1 GiB |
 | bitsandbytes PagedAdamW8bit, BF16 weights | 2.6549 | +0.0147 | 306 ms | 13.3 GiB | <0.1 GiB |
@@ -56,22 +56,22 @@ whole WikiText-2 validation split (start: 2.868).
 † growth of the process's resident memory beyond the all-GPU reference's.
 
 * **Noise.** Re-running the reference with two other data orders moved its final loss by
-  up to 0.0017, so differences below 0.002 are noise. All three adamx precisions are
+  up to 0.0017, so differences below 0.002 are noise. All three adambridge precisions are
   inside that band, and so is the same algorithm run entirely on the GPU: offloading the
   optimizer costs no quality.
 * **Why the BF16-only configurations fall behind.** An AdamW update at this learning rate is
   smaller than half the BF16 spacing of most weights, so without an FP32 copy it is rounded
   away: only 18% of their weights changed (at BF16 resolution) vs 84% for the reference.
-  adamx keeps BF16 weights on the GPU but the FP32 master on the host.
-* **Memory.** adamx needs 32% less GPU memory than the reference, the least of any
+  adambridge keeps BF16 weights on the GPU but the FP32 master on the host.
+* **Memory.** adambridge needs 32% less GPU memory than the reference, the least of any
   configuration at reference quality, and 2.7 GiB less than torchao's offload at the same quality.
-* **Speed.** With BF16 or FP8 moments adamx is 5–9% slower than the all-GPU reference
+* **Speed.** With BF16 or FP8 moments adambridge is 5–9% slower than the all-GPU reference
   (35% with FP32 moments) and needs 40% less time per step than torchao's offload at the
   same quality (25% less with FP32 moments). The GPU waits once per step for the update of
   the last gradient of the backward pass. This laptop's GPU also drops its clocks whenever it
   idles: a forward+backward pass that takes 251 ms back to back takes 22% longer after a 20 ms
   pause and 33% longer after a 50 ms one, which every CPU-offload optimizer pays.
-* **Host memory.** adamx's host footprint is its FP32 master, the moments and one gradient and
+* **Host memory.** adambridge's host footprint is its FP32 master, the moments and one gradient and
   one write-back buffer per parameter: with FP8 moments, less than torchao's BF16 offload,
   which keeps no FP32 master.
 
@@ -84,9 +84,9 @@ SmolLM2-135M fine-tuned on WikiText-2: 60 steps of 8 × 256 tokens, same protoco
 |---|---:|---:|---:|---:|---:|
 | PyTorch AdamW, FP32 weights + autocast (**reference**) | 3.1245 | | 94 ms | 4.74 GiB | |
 | PyTorch AdamW, BF16 weights + FP32 master, all on GPU | 3.1260 | +0.0015 | 89 ms | 4.38 GiB | <0.1 GiB |
-| **adamx, FP32 moments** | 3.1259 | +0.0014 | 115 ms | 2.86 GiB | +2.1 GiB |
-| **adamx, BF16 moments** | 3.1258 | +0.0013 | 106 ms | 2.86 GiB | +1.6 GiB |
-| **adamx, FP8 moments** | 3.1232 | −0.0013 | 105 ms | 2.86 GiB | +1.4 GiB |
+| **adambridge, FP32 moments** | 3.1259 | +0.0014 | 115 ms | 2.86 GiB | +2.1 GiB |
+| **adambridge, BF16 moments** | 3.1258 | +0.0013 | 106 ms | 2.86 GiB | +1.6 GiB |
+| **adambridge, FP8 moments** | 3.1232 | −0.0013 | 105 ms | 2.86 GiB | +1.4 GiB |
 | bitsandbytes AdamW8bit, FP32 weights | 3.1246 | +0.0001 | 109 ms | 3.98 GiB | <0.1 GiB |
 | bitsandbytes AdamW8bit, BF16 weights | 3.2867 | +0.1622 | 99 ms | 3.12 GiB | <0.1 GiB |
 | bitsandbytes PagedAdamW8bit, BF16 weights | 3.2867 | +0.1622 | 102 ms | 2.87 GiB | <0.1 GiB |
@@ -95,7 +95,7 @@ SmolLM2-135M fine-tuned on WikiText-2: 60 steps of 8 × 256 tokens, same protoco
 | PyTorch AdamW, BF16 weights only | 3.2866 | +0.1621 | 83 ms | 3.37 GiB | <0.1 GiB |
 
 The reference's own spread across data orders was 0.0014, so ties are called within 0.002.
-adamx uses 40% less GPU memory than the reference at the same quality. The BF16-only
+adambridge uses 40% less GPU memory than the reference at the same quality. The BF16-only
 configurations kept only 10–11% of the reference's loss reduction: 2% of their weights
 changed at BF16 resolution, vs 27% for the reference. This model showed no measurable GPU
 pause penalty (±0% after 20 ms, +2% after 50 ms).
@@ -112,12 +112,12 @@ steps. Except the all-GPU baseline, every configuration keeps BF16 weights on th
 | bitsandbytes AdamW8bit | 36.5 ms | 1.02 GiB | 8-bit m, v on GPU, no FP32 master |
 | bitsandbytes PagedAdamW8bit | 37.1 ms | 0.893 GiB | 8-bit m, v in unified memory, no FP32 master |
 | torchao CPUOffloadOptimizer | 36.1 ms | 0.891 GiB | BF16 copy + BF16 m, v on CPU, no FP32 master |
-| **adamx async, FP32 moments** | 40.6 ms | 0.891 GiB | FP32 master + FP32 m, v on CPU |
-| **adamx async, BF16 moments** | 36.6 ms | 0.891 GiB | FP32 master + BF16 m, v on CPU |
-| **adamx async, FP8 moments** | 36.1 ms | 0.891 GiB | FP32 master + FP8 m, v on CPU |
-| adamx sync (`step()`), FP32 / BF16 / FP8 moments | 60.8 / 54.0 / 51.0 ms | 0.891 GiB | as above |
+| **adambridge async, FP32 moments** | 40.6 ms | 0.891 GiB | FP32 master + FP32 m, v on CPU |
+| **adambridge async, BF16 moments** | 36.6 ms | 0.891 GiB | FP32 master + BF16 m, v on CPU |
+| **adambridge async, FP8 moments** | 36.1 ms | 0.891 GiB | FP32 master + FP8 m, v on CPU |
+| adambridge sync (`step()`), FP32 / BF16 / FP8 moments | 60.8 / 54.0 / 51.0 ms | 0.891 GiB | as above |
 
-With FP8 moments adamx is 3% slower than the all-GPU AdamW and uses 52% of its GPU memory.
+With FP8 moments adambridge is 3% slower than the all-GPU AdamW and uses 52% of its GPU memory.
 The asynchronous mode (`attach_hooks`) takes 29–33% less time per step than synchronous
 `step()` here.
 
@@ -131,31 +131,31 @@ the data stays in the CPU caches, so these times are optimistic.
 | `torch.optim.AdamW` (foreach, CPU) | 5.83 | 38 | 7.99 | 28 |
 | `torch.optim.AdamW(fused=True)` (CPU) | 2.31 | 97 | 1.98 | 113 |
 | DeepSpeed CPUAdam | – | – | 2.22 | 101 |
-| adamx native, FP32 moments | 1.83 | 123 | 2.13 | 105 |
-| adamx native, FP32 moments, BF16 gradient in + BF16 weights out | 1.92 | 116 | 2.43 | 92 |
-| adamx native, BF16 moments (same I/O) | 1.13 | 141 | 1.68 | 95 |
-| adamx native, FP8 moments (same I/O) | 1.80 | 72 | 3.19 | 40 |
-| adamx PyTorch fallback, FP32 / BF16 / FP8 moments | 4.48 / 7.20 / 10.55 | | 94.57 / 13.38 / 16.77 | |
+| adambridge native, FP32 moments | 1.83 | 123 | 2.13 | 105 |
+| adambridge native, FP32 moments, BF16 gradient in + BF16 weights out | 1.92 | 116 | 2.43 | 92 |
+| adambridge native, BF16 moments (same I/O) | 1.13 | 141 | 1.68 | 95 |
+| adambridge native, FP8 moments (same I/O) | 1.80 | 72 | 3.19 | 40 |
+| adambridge PyTorch fallback, FP32 / BF16 / FP8 moments | 4.48 / 7.20 / 10.55 | | 94.57 / 13.38 / 16.77 | |
 
-GB/s counts the minimum bytes each variant must move. The fastest adamx variant (BF16
+GB/s counts the minimum bytes each variant must move. The fastest adambridge variant (BF16
 moments) is 2.0× faster than PyTorch's fused CPU AdamW on Windows and 1.18× under WSL.
-With FP32 moments adamx is 1.26× faster on Windows and slightly slower under WSL
+With FP32 moments adambridge is 1.26× faster on Windows and slightly slower under WSL
 (2.13 vs 1.98 ms). FP8 moments trade kernel speed for host memory; under WSL they are the slowest
 native variant.
 
 ## Install
 
 ```bash
-pip install .               # or: uv pip install .   /   uv add ./adamx
+pip install .               # or: uv pip install .   /   uv add ./adambridge
 pip install ".[compiler]"   # also installs ziglang, a C compiler for machines without one
-python -m adamx build       # optional: compile the native kernels now
-python -m adamx info        # shows the ISA, NUMA nodes and L2 size
+python -m adambridge build       # optional: compile the native kernels now
+python -m adambridge info        # shows the ISA, NUMA nodes and L2 size
 ```
 
-adamx is a pure-Python wheel (`py3-none-any`) that carries its C source, so the same
+adambridge is a pure-Python wheel (`py3-none-any`) that carries its C source, so the same
 artifact installs everywhere.
 
-**CUDA torch:** adamx only declares `torch>=2.1`. On Windows, and for specific CUDA
+**CUDA torch:** adambridge only declares `torch>=2.1`. On Windows, and for specific CUDA
 versions, PyPI's `torch` is CPU-only, so a clean `pip`/`uv` install pulls the CPU build.
 Install torch from the PyTorch index first (`pip install torch --index-url
 https://download.pytorch.org/whl/cu130`). With uv, pin it in your project instead:
@@ -171,10 +171,10 @@ explicit = true
 ```
 
 The native kernel is plain C, loaded through `ctypes`, and compiled on first use into
-`~/.cache/adamx` (override with `ADAMX_CACHE_DIR`). The build tries `$ADAMX_CC`, then
+`~/.cache/adambridge` (override with `ADAMBRIDGE_CACHE_DIR`). The build tries `$ADAMBRIDGE_CC`, then
 `cc`, `gcc`, `clang`, then `python -m ziglang cc` (`pip install ziglang` gives Windows
-a compiler), then MSVC `cl`. If none works, adamx falls back to the PyTorch kernels,
-which support everything but are slower. Set `ADAMX_DISABLE_NATIVE=1` to force the fallback.
+a compiler), then MSVC `cl`. If none works, adambridge falls back to the PyTorch kernels,
+which support everything but are slower. Set `ADAMBRIDGE_DISABLE_NATIVE=1` to force the fallback.
 
 ## How it works
 
@@ -203,9 +203,9 @@ H2D stream, so no device-wide synchronization is needed.
 * **Small parameters are grouped.** Parameters below `small_param_threshold` (65,536 elements:
   norms, biases) get no per-tensor hook; at `step_sync()` they move as one buffer each way.
 * **Exact-size pinned buffers.** PyTorch's pinned allocator rounds every buffer up to a power
-  of two, so a 272 MB gradient buffer locks 512 MB. adamx registers ordinary allocations of 1 MiB
+  of two, so a 272 MB gradient buffer locks 512 MB. adambridge registers ordinary allocations of 1 MiB
   or more with CUDA instead, which locks exactly their size.
-* **Fused kernel** (`adamx/csrc/adamx_kernels.c`): one pass reads p, g, m and v and writes
+* **Fused kernel** (`adambridge/csrc/adambridge_kernels.c`): one pass reads p, g, m and v and writes
   p, m, v and the low-precision copy for the GPU. ISA is chosen at runtime: AVX-512F,
   AVX2+FMA, NEON or scalar. The arithmetic is exactly `torch.optim.AdamW`'s.
 * **Moment storage** (`precision=`):
@@ -230,7 +230,7 @@ H2D stream, so no device-wide synchronization is needed.
 1. **Stochastic rounding for BF16/FP8 moments.** With round-to-nearest and β₂ = 0.999, the
    per-step change in `v` is smaller than half a BF16 ulp, so `v` freezes.
    `test_ema_stalls_without_stochastic_rounding` shows it sticking at its initial value.
-   adamx rounds stochastically using a counter-based hash. The native and PyTorch kernels
+   adambridge rounds stochastically using a counter-based hash. The native and PyTorch kernels
    use the same hash, so they make the same rounding decisions, and results do not depend
    on the thread split or on chunking.
 2. **FP8 stores `sqrt(v)`, not `v`.** Block-scaled E5M2 `v` flushes to zero for any element
@@ -250,7 +250,7 @@ H2D stream, so no device-wide synchronization is needed.
 ## Parameters
 
 ```python
-adamx.AdamX(
+adambridge.AdamBridge(
     params,
     lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2,
     *,                                   # everything below is keyword-only
@@ -300,15 +300,15 @@ These behave exactly as in `torch.optim.AdamW`. They can differ between paramete
 | `small_param_threshold` | `65536` | int `>= 0` | CUDA parameters with fewer elements than this (norms, biases) get no per-tensor hook and are updated together at `step_sync()`, with one transfer each way. Their update takes microseconds, while a hook costs tens of microseconds of Python. `0` hooks every parameter. |
 | `autotune` | `False` | `False`, `True`, or an `AutoTuneConfig` | Tunes the thread count and moment precision while training (see below). `True` uses `AutoTuneConfig()` defaults. Decisions are made from `step_sync()` timings and recorded in `opt.autotune_log`. |
 
-### Auto-tuning (`adamx.autotune.AutoTuneConfig`)
+### Auto-tuning (`adambridge.autotune.AutoTuneConfig`)
 
 The tuner first benchmarks thread counts once. Then, if the CPU update takes longer than the
 GPU's backward pass, it steps the moment precision down one level (`fp32` → `bf16` → `fp8`).
 It keeps the change only if the update actually got faster, and stops at the first decision.
 
 ```python
-from adamx.autotune import AutoTuneConfig
-opt = adamx.AdamX(model.parameters(), autotune=AutoTuneConfig(min_precision="fp8"))
+from adambridge.autotune import AutoTuneConfig
+opt = adambridge.AdamBridge(model.parameters(), autotune=AutoTuneConfig(min_precision="fp8"))
 ```
 
 | field | default | accepted values | meaning and use |
@@ -356,17 +356,17 @@ decisions) and `opt.last_step_stats`.
 
 | variable | default | meaning and use |
 |---|---|---|
-| `ADAMX_CACHE_DIR` | `~/.cache/adamx` | Where the compiled native kernel is stored. |
-| `ADAMX_CC` | unset | Compiler command to try first, e.g. `gcc`, `clang -march=native` or `cl`. |
-| `ADAMX_DISABLE_NATIVE` | unset | Any value except `0` forces the PyTorch fallback kernels. |
-| `ADAMX_SPIN` | `4000` | How long the update threads busy-wait (in CPU pause instructions) for the next job before sleeping. Higher reacts faster between updates but burns CPU; `0` sleeps immediately. |
+| `ADAMBRIDGE_CACHE_DIR` | `~/.cache/adambridge` | Where the compiled native kernel is stored. |
+| `ADAMBRIDGE_CC` | unset | Compiler command to try first, e.g. `gcc`, `clang -march=native` or `cl`. |
+| `ADAMBRIDGE_DISABLE_NATIVE` | unset | Any value except `0` forces the PyTorch fallback kernels. |
+| `ADAMBRIDGE_SPIN` | `4000` | How long the update threads busy-wait (in CPU pause instructions) for the next job before sleeping. Higher reacts faster between updates but burns CPU; `0` sleeps immediately. |
 
 ### Command line
 
 | command | use |
 |---|---|
-| `python -m adamx build [--force] [--verbose]` | Compile the native kernel now instead of on first use. `--force` rebuilds; `--verbose` prints the compiler output. |
-| `python -m adamx info` | Shows the kernel library path, SIMD level, NUMA nodes and L2 cache size. |
+| `python -m adambridge build [--force] [--verbose]` | Compile the native kernel now instead of on first use. `--force` rebuilds; `--verbose` prints the compiler output. |
+| `python -m adambridge info` | Shows the kernel library path, SIMD level, NUMA nodes and L2 cache size. |
 
 ### Things to know
 
@@ -394,13 +394,13 @@ Results from the 2026-10-28 report:
 
 What the tests check:
 
-* adamx's updates against `torch.optim.AdamW` on CPU and GPU (FP32 tolerance: rtol 1e-6,
+* adambridge's updates against `torch.optim.AdamW` on CPU and GPU (FP32 tolerance: rtol 1e-6,
   atol 1e-7), in sync and async modes.
 * Parameter groups, schedulers, weight tying, gradient accumulation, gradient clipping, BF16
   params, checkpoint resume, chunked updates, exact-size pinned buffers, and the auto-tuner.
 * The C self-test compares the SIMD paths against scalar code and checks the FP8 codec and
   thread-count and chunking invariance.
-* `adamx-lab` runs all of this plus the benchmarks and the LLM fine-tuning comparison from
+* `adambridge-lab` runs all of this plus the benchmarks and the LLM fine-tuning comparison from
   one page, and writes the reports.
 
 ## Limitations / not yet verified
@@ -415,3 +415,7 @@ What the tests check:
   run slower too.
 * Not covered yet: FP16 gradients with `GradScaler`, and integration with DDP or FSDP
   sharding (single-process, one or more GPUs).
+
+## License
+
+Copyright 2026 John Anish G. Licensed under the [Apache License, Version 2.0](LICENSE).

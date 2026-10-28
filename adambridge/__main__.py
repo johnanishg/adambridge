@@ -1,4 +1,4 @@
-"""``python -m adamx {build,info}``: build the native kernels or show what will be used."""
+"""``python -m adambridge {build,info}``: build the native kernels or show what will be used."""
 
 import sys
 

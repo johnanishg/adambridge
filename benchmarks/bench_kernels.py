@@ -1,4 +1,4 @@
-"""Host AdamW step throughput: adamx kernels vs torch.optim.AdamW on CPU.
+"""Host AdamW step throughput: adambridge kernels vs torch.optim.AdamW on CPU.
 
     python benchmarks/bench_kernels.py --numel 64M --threads 8
 
@@ -14,10 +14,10 @@ import time
 
 import torch
 
-from adamx import native
-from adamx.engine import UpdateEngine
-from adamx.kernels import StepCoefficients
-from adamx.precision import make_store
+from adambridge import native
+from adambridge.engine import UpdateEngine
+from adambridge.kernels import StepCoefficients
+from adambridge.precision import make_store
 
 
 def parse_numel(text: str) -> int:
@@ -43,7 +43,7 @@ def bench_torch_adamw(n, repeats, **kw):
     return timeit(opt.step, repeats)
 
 
-def bench_adamx(n, repeats, precision, backend, threads, grad_dtype, out_dtype):
+def bench_adambridge(n, repeats, precision, backend, threads, grad_dtype, out_dtype):
     eng = UpdateEngine(precision=precision, backend=backend, numa_aware=False, num_threads=threads)
     try:
         pool = eng.ensure_pool(torch.device("cpu"))
@@ -92,8 +92,8 @@ def main():
     ]
     for backend in (["native"] if kernels else []) + ["torch"]:
         for precision, gdt, odt in configs:
-            label = f"adamx {backend:<6} moments={precision:<4} grad={str(gdt)[6:]:<8} out={str(odt)[6:] if odt else '-'}"
-            t = bench_adamx(n, args.repeats, precision, backend, threads, gdt, odt)
+            label = f"adambridge {backend:<6} moments={precision:<4} grad={str(gdt)[6:]:<8} out={str(odt)[6:] if odt else '-'}"
+            t = bench_adambridge(n, args.repeats, precision, backend, threads, gdt, odt)
             row(label, t, min_bytes(precision, 2 if gdt == torch.bfloat16 else 4, 2 if odt else 0))
 
 

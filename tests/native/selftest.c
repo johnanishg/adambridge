@@ -10,7 +10,7 @@
  *    search over all codes) and stochastic rounding is unbiased;
  * 3. multi-tensor updates are bit-identical for any thread count, FP8 included.
  */
-#include "../../adamx/csrc/adamx_kernels.c"
+#include "../../adambridge/csrc/adambridge_kernels.c"
 
 #include <stdio.h>
 
@@ -58,9 +58,9 @@ static double max_rel(const void* a, const void* b, int dt, int64_t n)
     return worst;
 }
 
-static adamx_hparams test_hparams(int sr)
+static adambridge_hparams test_hparams(int sr)
 {
-    adamx_hparams h = { 0.9f, 0.999f, 0.1f, 0.001f, 1.0f - 1e-3f * 0.01f, 1e-3f / 0.1f, 1.0f / sqrtf(0.001f), 1e-8f, 0xC0FFEEu, sr };
+    adambridge_hparams h = { 0.9f, 0.999f, 0.1f, 0.001f, 1.0f - 1e-3f * 0.01f, 1e-3f / 0.1f, 1.0f / sqrtf(0.001f), 1e-8f, 0xC0FFEEu, sr };
     return h;
 }
 
@@ -70,17 +70,17 @@ static void simd_case(int level, int gt, int mvt, int ot, int sr, int64_t n, int
     bufs_t tst = { malloc(n * 4), alloc_dt(gt, n), alloc_dt(mvt, n), alloc_dt(mvt, n), alloc_dt(ot, n) };
     fill(&ref, gt, mvt, n);
     fill(&tst, gt, mvt, n);
-    adamx_hparams h = test_hparams(sr);
+    adambridge_hparams h = test_hparams(sr);
 
-    adamx_set_simd_level(0);
-    adamx_fused_adamw(ref.p, ref.g, gt, ref.m, ref.v, mvt, ref.out, ot, n, 0, &h);
-    int actual = adamx_set_simd_level(level);
+    adambridge_set_simd_level(0);
+    adambridge_fused_adamw(ref.p, ref.g, gt, ref.m, ref.v, mvt, ref.out, ot, n, 0, &h);
+    int actual = adambridge_set_simd_level(level);
     const int64_t a = split ? (n / 3) & ~(int64_t)15 : n;
     size_t ms = mvt == 1 ? 4 : 2, gs = gt == 1 ? 4 : 2, os = ot == 1 ? 4 : 2;
-    adamx_fused_adamw(tst.p, tst.g, gt, tst.m, tst.v, mvt, tst.out, ot, a, 0, &h);
+    adambridge_fused_adamw(tst.p, tst.g, gt, tst.m, tst.v, mvt, tst.out, ot, a, 0, &h);
     if (a < n)
-        adamx_fused_adamw(tst.p + a, (char*)tst.g + a * gs, gt, (char*)tst.m + a * ms, (char*)tst.v + a * ms, mvt,
-                          tst.out ? (char*)tst.out + a * os : NULL, ot, n - a, (uint64_t)a, &h);
+        adambridge_fused_adamw(tst.p + a, (char*)tst.g + a * gs, gt, (char*)tst.m + a * ms, (char*)tst.v + a * ms, mvt,
+                               tst.out ? (char*)tst.out + a * os : NULL, ot, n - a, (uint64_t)a, &h);
 
     /* FMA vs separate mul/add may differ by a few ulp; BF16 storage may then
      * round to a neighbouring value (one bf16 ulp = 2^-8 relative). */
@@ -162,13 +162,13 @@ static void codec_checks(void)
 /* ------------------------------------------------------------------------- */
 
 typedef struct {
-    adamx_segment seg;
+    adambridge_segment seg;
     int64_t nblocks;
 } tseg_t;
 
 static void make_segment(tseg_t* t, int64_t n, int gt, int mvt, int ot, uint32_t seed)
 {
-    adamx_segment* s = &t->seg;
+    adambridge_segment* s = &t->seg;
     memset(s, 0, sizeof(*s));
     s->n = n;
     s->g_dtype = gt;
@@ -197,7 +197,7 @@ static void make_segment(tseg_t* t, int64_t n, int gt, int mvt, int ot, uint32_t
 
 static void free_segment(tseg_t* t)
 {
-    adamx_segment* s = &t->seg;
+    adambridge_segment* s = &t->seg;
     free(s->p); free((void*)s->g); free(s->m); free(s->v); free(s->m_scale); free(s->v_scale); free(s->out);
 }
 
@@ -210,9 +210,9 @@ static void multi_case(int threads)
     const int mvts[] = { DT_F32, DT_BF16, DT_FP8 };
     enum { NS = 6 * 3 };
     tseg_t a[NS], b[NS];
-    adamx_segment* pa[NS];
-    adamx_segment* pb[NS];
-    adamx_hparams hps[NS];
+    adambridge_segment* pa[NS];
+    adambridge_segment* pb[NS];
+    adambridge_hparams hps[NS];
     int k = 0;
     for (int mi = 0; mi < 3; ++mi)
         for (int si = 0; si < 6; ++si, ++k) {
@@ -225,16 +225,16 @@ static void multi_case(int threads)
             hps[k] = test_hparams(1);
             hps[k].seed = 77u + (uint32_t)k;
         }
-    void* pool = adamx_pool_create(threads, NULL, 0);
+    void* pool = adambridge_pool_create(threads, NULL, 0);
     for (int step = 0; step < 3; ++step) {           /* several steps: FP8 scales evolve */
-        CHECK(adamx_multi_apply(NULL, pa, hps, NS, 1) == 0, "multi_apply single");
-        CHECK(adamx_multi_apply(pool, pb, hps, NS, threads) == 0, "multi_apply pool");
+        CHECK(adambridge_multi_apply(NULL, pa, hps, NS, 1) == 0, "multi_apply single");
+        CHECK(adambridge_multi_apply(pool, pb, hps, NS, threads) == 0, "multi_apply pool");
     }
-    adamx_pool_destroy(pool);
+    adambridge_pool_destroy(pool);
     int diff = 0;
     for (int i = 0; i < NS; ++i) {
-        const adamx_segment* x = pa[i];
-        const adamx_segment* y = pb[i];
+        const adambridge_segment* x = pa[i];
+        const adambridge_segment* y = pb[i];
         const size_t n = (size_t)x->n;
         const size_t mb = x->mv_dtype == DT_F32 ? 4 : (x->mv_dtype == DT_BF16 ? 2 : 1);
         const size_t mlen = x->mv_dtype == DT_FP8 ? (size_t)a[i].nblocks * FP8_BLOCK : n;
@@ -254,12 +254,12 @@ static void fresh_pool_case(void)
 {
     tseg_t t;
     make_segment(&t, 200000, DT_F32, DT_F32, DT_NONE, 3);   /* several work items */
-    adamx_segment* ps = &t.seg;
-    adamx_hparams h = test_hparams(0);
+    adambridge_segment* ps = &t.seg;
+    adambridge_hparams h = test_hparams(0);
     for (int i = 0; i < 300; ++i) {
-        void* pool = adamx_pool_create(2 + i % 7, NULL, 0);
-        CHECK(adamx_multi_apply(pool, &ps, &h, 1, 2 + i % 7) == 0, "fresh pool %d", i);
-        adamx_pool_destroy(pool);
+        void* pool = adambridge_pool_create(2 + i % 7, NULL, 0);
+        CHECK(adambridge_multi_apply(pool, &ps, &h, 1, 2 + i % 7) == 0, "fresh pool %d", i);
+        adambridge_pool_destroy(pool);
     }
     free_segment(&t);
 }
@@ -273,9 +273,9 @@ static void chunk_case(int mvt)
     tseg_t a, b;
     make_segment(&a, n, DT_BF16, mvt, DT_BF16, 9);
     make_segment(&b, n, DT_BF16, mvt, DT_BF16, 9);
-    adamx_segment* pa = &a.seg;
-    adamx_segment chunks[3];
-    adamx_segment* pc[3];
+    adambridge_segment* pa = &a.seg;
+    adambridge_segment chunks[3];
+    adambridge_segment* pc[3];
     const size_t mb = mvt == DT_F32 ? 4 : (mvt == DT_BF16 ? 2 : 1);
     for (int c = 0; c < 3; ++c) {
         const int64_t lo = cuts[c];
@@ -293,11 +293,11 @@ static void chunk_case(int mvt)
         chunks[c].offset = lo;
         pc[c] = &chunks[c];
     }
-    adamx_hparams h = test_hparams(1);
-    adamx_hparams hs[3] = { h, h, h };
+    adambridge_hparams h = test_hparams(1);
+    adambridge_hparams hs[3] = { h, h, h };
     for (int step = 0; step < 3; ++step) {
-        CHECK(adamx_multi_apply(NULL, &pa, &h, 1, 1) == 0, "chunk_case whole");
-        CHECK(adamx_multi_apply(NULL, pc, hs, 3, 1) == 0, "chunk_case chunks");
+        CHECK(adambridge_multi_apply(NULL, &pa, &h, 1, 1) == 0, "chunk_case whole");
+        CHECK(adambridge_multi_apply(NULL, pc, hs, 3, 1) == 0, "chunk_case chunks");
     }
     const size_t mlen = mvt == DT_FP8 ? (size_t)a.nblocks * FP8_BLOCK : (size_t)n;
     int ok = same_bytes(a.seg.p, b.seg.p, (size_t)n * 4) && same_bytes(a.seg.out, b.seg.out, (size_t)n * 2)
@@ -307,7 +307,7 @@ static void chunk_case(int mvt)
                 && same_bytes(a.seg.v_scale, b.seg.v_scale, (size_t)a.nblocks * 4);
     CHECK(ok, "moments %d: chunked update differs from the whole-tensor update", mvt);
     chunks[1].offset = mvt == DT_FP8 ? 100 : -1;            /* misaligned / negative: rejected */
-    CHECK(adamx_multi_apply(NULL, &pc[1], hs, 1, 1) == -11, "moments %d: bad offset accepted", mvt);
+    CHECK(adambridge_multi_apply(NULL, &pc[1], hs, 1, 1) == -11, "moments %d: bad offset accepted", mvt);
     free_segment(&a);
     free_segment(&b);
 }
@@ -320,14 +320,14 @@ static void fp8_simd_case(int level)
     const int64_t n = 50000;
     make_segment(&a, n, DT_BF16, DT_FP8, DT_BF16, 5);
     make_segment(&b, n, DT_BF16, DT_FP8, DT_BF16, 5);
-    adamx_segment* pa = &a.seg;
-    adamx_segment* pb = &b.seg;
-    adamx_hparams h = test_hparams(1);
-    adamx_set_simd_level(0);
-    for (int step = 0; step < 3; ++step) adamx_multi_apply(NULL, &pa, &h, 1, 1);
-    const int actual = adamx_set_simd_level(level);
-    for (int step = 0; step < 3; ++step) adamx_multi_apply(NULL, &pb, &h, 1, 1);
-    adamx_set_simd_level(-1);
+    adambridge_segment* pa = &a.seg;
+    adambridge_segment* pb = &b.seg;
+    adambridge_hparams h = test_hparams(1);
+    adambridge_set_simd_level(0);
+    for (int step = 0; step < 3; ++step) adambridge_multi_apply(NULL, &pa, &h, 1, 1);
+    const int actual = adambridge_set_simd_level(level);
+    for (int step = 0; step < 3; ++step) adambridge_multi_apply(NULL, &pb, &h, 1, 1);
+    adambridge_set_simd_level(-1);
     int64_t same_m = 0, same_v = 0;
     for (int64_t i = 0; i < n; ++i) {
         same_m += ((uint8_t*)pa->m)[i] == ((uint8_t*)pb->m)[i];
@@ -342,7 +342,7 @@ static void fp8_simd_case(int level)
 
 int main(void)
 {
-    const int det = adamx_detected_simd_level();
+    const int det = adambridge_detected_simd_level();
     printf("detected SIMD level: %d\n", det);
     int levels[3] = { 0, 1, 2 };
     int nlev = det == 2 ? 3 : (det == 1 ? 2 : 1);
@@ -358,7 +358,7 @@ int main(void)
                         for (int si = 0; si < 3; ++si)
                             for (int split = 0; split <= 1; ++split, ++cases)
                                 simd_case(levels[li], gt, mvt, ot, sr, sizes[si], split);
-    adamx_set_simd_level(-1);
+    adambridge_set_simd_level(-1);
     printf("simd vs scalar: %d cases\n", cases);
 
     codec_checks();

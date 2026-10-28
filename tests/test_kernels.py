@@ -1,10 +1,10 @@
 import pytest
 import torch
 
-from adamx import native
-from adamx.engine import UpdateEngine
-from adamx.kernels import StepCoefficients, fused_adamw_chunk, split_range
-from adamx.precision import make_store
+from adambridge import native
+from adambridge.engine import UpdateEngine
+from adambridge.kernels import StepCoefficients, fused_adamw_chunk, split_range
+from adambridge.precision import make_store
 
 from conftest import NATIVE
 

@@ -28,7 +28,7 @@ from .precision import PRECISIONS, canonical_precision, make_store
 
 __all__ = ["AutoTuneConfig", "AutoTuner", "benchmark_threads"]
 
-log = logging.getLogger("adamx")
+log = logging.getLogger("adambridge")
 
 
 @dataclass
@@ -94,13 +94,13 @@ class AutoTuner:
         self._baseline = (precision, cpu)
         self._seen = 0
         self.decisions.append(f"host-bound ({cpu * 1e3:.1f} ms vs {gpu * 1e3:.1f} ms): trying {nxt} moments")
-        log.info("adamx autotune: %s", self.decisions[-1])
+        log.info("adambridge autotune: %s", self.decisions[-1])
         return nxt
 
     def _finish(self, reason: str, precision: str | None = None) -> str | None:
         self.done = True
         self.decisions.append(reason)
-        log.info("adamx autotune: %s", reason)
+        log.info("adambridge autotune: %s", reason)
         return precision
 
 
@@ -139,6 +139,6 @@ def benchmark_threads(
     # Within 3% of the best, prefer fewer threads: leaves cores for the training loop.
     best = min(k for k, t in timings.items() if t <= timings[best] * 1.03)
     pool.parallelism = best
-    log.info("adamx: %d update threads for %s (%s)", best, device,
+    log.info("adambridge: %d update threads for %s (%s)", best, device,
              ", ".join(f"{k}: {t * 1e3:.2f} ms" for k, t in timings.items()))
     return timings

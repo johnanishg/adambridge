@@ -1,21 +1,21 @@
 """Build and load the native SIMD kernel library.
 
-The kernels are plain C (``csrc/adamx_kernels.c``) loaded with ctypes, so
+The kernels are plain C (``csrc/adambridge_kernels.c``) loaded with ctypes, so
 no libtorch headers or matching compiler ABI are needed. ctypes releases the
 GIL for the duration of each call, which lets the optimizer's worker threads
 run the kernel truly in parallel.
 
-The library is compiled on first use and cached under ``ADAMX_CACHE_DIR``
-(default ``~/.cache/adamx``), keyed by a hash of the source. Compilers are
-tried in this order: ``$ADAMX_CC``, ``cc``, ``gcc``, ``clang``, the
+The library is compiled on first use and cached under ``ADAMBRIDGE_CACHE_DIR``
+(default ``~/.cache/adambridge``), keyed by a hash of the source. Compilers are
+tried in this order: ``$ADAMBRIDGE_CC``, ``cc``, ``gcc``, ``clang``, the
 ``ziglang`` pip package (``python -m ziglang cc``), and MSVC ``cl``.
 
-Set ``ADAMX_DISABLE_NATIVE=1`` to force the pure-PyTorch kernels.
+Set ``ADAMBRIDGE_DISABLE_NATIVE=1`` to force the pure-PyTorch kernels.
 
 Command line::
 
-    python -m adamx build [--force] [--verbose]
-    python -m adamx info
+    python -m adambridge build [--force] [--verbose]
+    python -m adambridge info
 """
 
 from __future__ import annotations
@@ -39,10 +39,10 @@ import torch
 
 __all__ = ["NativeKernels", "Group", "Segment", "load", "build", "available", "SIMD_NAMES", "BuildError"]
 
-log = logging.getLogger("adamx.native")
+log = logging.getLogger("adambridge.native")
 
 ABI_VERSION = 3
-SOURCE = Path(__file__).with_name("csrc") / "adamx_kernels.c"
+SOURCE = Path(__file__).with_name("csrc") / "adambridge_kernels.c"
 SIMD_NAMES = {0: "scalar", 1: "avx2", 2: "avx512", 3: "neon"}
 
 DT_NONE, DT_F32, DT_BF16, DT_FP8 = 0, 1, 2, 3
@@ -70,7 +70,7 @@ class _HParams(ctypes.Structure):
 
 
 class Group(ctypes.Structure):
-    """Hyperparameters shared by the segments of one parameter group (adamx_group)."""
+    """Hyperparameters shared by the segments of one parameter group (adambridge_group)."""
 
     _fields_ = [
         ("lr", ctypes.c_double),
@@ -85,7 +85,7 @@ class Group(ctypes.Structure):
 
 
 class Segment(ctypes.Structure):
-    """One tensor's host buffers (adamx_segment). Pointers are raw addresses."""
+    """One tensor's host buffers (adambridge_segment). Pointers are raw addresses."""
 
     _fields_ = [
         ("p", ctypes.c_void_p),
@@ -116,14 +116,14 @@ def _lib_suffix() -> str:
 
 
 def cache_dir() -> Path:
-    root = os.environ.get("ADAMX_CACHE_DIR")
-    return Path(root) if root else Path.home() / ".cache" / "adamx"
+    root = os.environ.get("ADAMBRIDGE_CACHE_DIR")
+    return Path(root) if root else Path.home() / ".cache" / "adambridge"
 
 
 def _source_tag() -> str:
     digest = hashlib.sha256(SOURCE.read_bytes()).hexdigest()[:16]
     plat = sysconfig.get_platform().replace("-", "_").replace(".", "_")
-    return f"adamx_kernels_{plat}_{digest}"
+    return f"adambridge_kernels_{plat}_{digest}"
 
 
 def library_path() -> Path:
@@ -133,7 +133,7 @@ def library_path() -> Path:
 def _compiler_candidates() -> list[tuple[str, list[str]]]:
     """(kind, argv-prefix) pairs; kind is 'gnu' (gcc/clang-style flags) or 'msvc'."""
     found: list[tuple[str, list[str]]] = []
-    env_cc = os.environ.get("ADAMX_CC")
+    env_cc = os.environ.get("ADAMBRIDGE_CC")
     if env_cc:
         argv = shlex.split(env_cc, posix=sys.platform != "win32")
         kind = "msvc" if Path(argv[0]).stem.lower() == "cl" else "gnu"
@@ -170,7 +170,7 @@ def build(force: bool = False, verbose: bool = False) -> Path:
     if not candidates:
         raise BuildError(
             "no C compiler found; install gcc/clang, `pip install ziglang`, "
-            "or point ADAMX_CC at a compiler"
+            "or point ADAMBRIDGE_CC at a compiler"
         )
     errors = []
     for kind, prefix in candidates:
@@ -178,7 +178,7 @@ def build(force: bool = False, verbose: bool = False) -> Path:
             out = Path(tmp) / target.name
             cmd = _compile_cmd(kind, prefix, out)
             if verbose:
-                print("adamx: compiling:", " ".join(cmd), file=sys.stderr)
+                print("adambridge: compiling:", " ".join(cmd), file=sys.stderr)
             try:
                 proc = subprocess.run(cmd, cwd=tmp, capture_output=True, text=True, timeout=300)
             except (OSError, subprocess.TimeoutExpired) as exc:
@@ -195,7 +195,7 @@ def build(force: bool = False, verbose: bool = False) -> Path:
 
 @dataclass(frozen=True)
 class StepCoefficients:
-    """Per-step scalars for the fused update (see ``csrc/adamx_kernels.c``)."""
+    """Per-step scalars for the fused update (see ``csrc/adambridge_kernels.c``)."""
 
     beta1: float
     beta2: float
@@ -224,49 +224,49 @@ class NativeKernels:
     def __init__(self, path: Path):
         self.path = path
         lib = ctypes.CDLL(str(path))
-        lib.adamx_abi_version.restype = ctypes.c_int
-        if lib.adamx_abi_version() != ABI_VERSION:
-            raise BuildError(f"{path} has ABI {lib.adamx_abi_version()}, expected {ABI_VERSION}")
-        for fn, struct in (("adamx_hparams_size", _HParams), ("adamx_group_size", Group), ("adamx_segment_size", Segment)):
+        lib.adambridge_abi_version.restype = ctypes.c_int
+        if lib.adambridge_abi_version() != ABI_VERSION:
+            raise BuildError(f"{path} has ABI {lib.adambridge_abi_version()}, expected {ABI_VERSION}")
+        for fn, struct in (("adambridge_hparams_size", _HParams), ("adambridge_group_size", Group), ("adambridge_segment_size", Segment)):
             if getattr(lib, fn)() != ctypes.sizeof(struct):
                 raise BuildError(f"{fn}: struct layout mismatch between C and Python")
-        for fn in ("adamx_simd_level", "adamx_detected_simd_level", "adamx_set_simd_level"):
+        for fn in ("adambridge_simd_level", "adambridge_detected_simd_level", "adambridge_set_simd_level"):
             getattr(lib, fn).restype = ctypes.c_int
-        lib.adamx_set_simd_level.argtypes = [ctypes.c_int]
-        lib.adamx_fused_adamw.restype = ctypes.c_int
-        lib.adamx_fused_adamw.argtypes = [
+        lib.adambridge_set_simd_level.argtypes = [ctypes.c_int]
+        lib.adambridge_fused_adamw.restype = ctypes.c_int
+        lib.adambridge_fused_adamw.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
             ctypes.c_void_p, ctypes.c_int,
             ctypes.c_int64, ctypes.c_uint64, ctypes.POINTER(_HParams),
         ]
-        lib.adamx_pool_create.restype = ctypes.c_void_p
-        lib.adamx_pool_create.argtypes = [ctypes.c_int32, ctypes.POINTER(ctypes.c_int32), ctypes.c_int32]
-        lib.adamx_pool_destroy.restype = None
-        lib.adamx_pool_destroy.argtypes = [ctypes.c_void_p]
-        lib.adamx_pool_threads.restype = ctypes.c_int32
-        lib.adamx_pool_threads.argtypes = [ctypes.c_void_p]
-        lib.adamx_pool_set_spin.restype = None
-        lib.adamx_pool_set_spin.argtypes = [ctypes.c_void_p, ctypes.c_int32]
+        lib.adambridge_pool_create.restype = ctypes.c_void_p
+        lib.adambridge_pool_create.argtypes = [ctypes.c_int32, ctypes.POINTER(ctypes.c_int32), ctypes.c_int32]
+        lib.adambridge_pool_destroy.restype = None
+        lib.adambridge_pool_destroy.argtypes = [ctypes.c_void_p]
+        lib.adambridge_pool_threads.restype = ctypes.c_int32
+        lib.adambridge_pool_threads.argtypes = [ctypes.c_void_p]
+        lib.adambridge_pool_set_spin.restype = None
+        lib.adambridge_pool_set_spin.argtypes = [ctypes.c_void_p, ctypes.c_int32]
         seg_array = ctypes.POINTER(ctypes.POINTER(Segment))
-        lib.adamx_multi_step.restype = ctypes.c_int
-        lib.adamx_multi_step.argtypes = [ctypes.c_void_p, seg_array, ctypes.c_int32, ctypes.c_int32]
-        lib.adamx_multi_apply.restype = ctypes.c_int
-        lib.adamx_multi_apply.argtypes = [ctypes.c_void_p, seg_array, ctypes.POINTER(_HParams), ctypes.c_int32, ctypes.c_int32]
+        lib.adambridge_multi_step.restype = ctypes.c_int
+        lib.adambridge_multi_step.argtypes = [ctypes.c_void_p, seg_array, ctypes.c_int32, ctypes.c_int32]
+        lib.adambridge_multi_apply.restype = ctypes.c_int
+        lib.adambridge_multi_apply.argtypes = [ctypes.c_void_p, seg_array, ctypes.POINTER(_HParams), ctypes.c_int32, ctypes.c_int32]
         self._lib = lib
 
     @property
     def simd_level(self) -> str:
-        return SIMD_NAMES[self._lib.adamx_simd_level()]
+        return SIMD_NAMES[self._lib.adambridge_simd_level()]
 
     @property
     def detected_simd_level(self) -> str:
-        return SIMD_NAMES[self._lib.adamx_detected_simd_level()]
+        return SIMD_NAMES[self._lib.adambridge_detected_simd_level()]
 
     def set_simd_level(self, name: str | None) -> str:
         """Restrict the ISA used (``None`` restores the best detected one)."""
         code = -1 if name is None else {v: k for k, v in SIMD_NAMES.items()}[name]
-        return SIMD_NAMES[self._lib.adamx_set_simd_level(code)]
+        return SIMD_NAMES[self._lib.adambridge_set_simd_level(code)]
 
     @staticmethod
     def supports(grad_dtype: torch.dtype, moment_precision: str, out_dtype: torch.dtype | None) -> bool:
@@ -285,19 +285,19 @@ class NativeKernels:
     def create_pool(self, threads: int, cpus: tuple[int, ...] | None = None) -> int:
         """Native pool of ``threads`` threads (the calling thread counts as one)."""
         arr = (ctypes.c_int32 * len(cpus))(*cpus) if cpus else None
-        handle = self._lib.adamx_pool_create(threads, arr, len(cpus) if cpus else 0)
+        handle = self._lib.adambridge_pool_create(threads, arr, len(cpus) if cpus else 0)
         if not handle:
-            raise RuntimeError("adamx_pool_create failed")
-        spin = os.environ.get("ADAMX_SPIN")
+            raise RuntimeError("adambridge_pool_create failed")
+        spin = os.environ.get("ADAMBRIDGE_SPIN")
         if spin:
-            self._lib.adamx_pool_set_spin(handle, int(spin))
+            self._lib.adambridge_pool_set_spin(handle, int(spin))
         return handle
 
     def destroy_pool(self, handle: int) -> None:
-        self._lib.adamx_pool_destroy(handle)
+        self._lib.adambridge_pool_destroy(handle)
 
     def pool_threads(self, handle: int) -> int:
-        return self._lib.adamx_pool_threads(handle)
+        return self._lib.adambridge_pool_threads(handle)
 
     # -- batched updates ---------------------------------------------------
 
@@ -308,16 +308,16 @@ class NativeKernels:
 
     def multi_step(self, pool: int | None, segments: ctypes.Array, threads: int) -> None:
         """Update every segment; coefficients come from each segment's group and step."""
-        rc = self._lib.adamx_multi_step(pool, segments, len(segments), threads)
+        rc = self._lib.adambridge_multi_step(pool, segments, len(segments), threads)
         if rc != 0:
-            raise RuntimeError(f"adamx_multi_step rejected a segment (code {rc})")
+            raise RuntimeError(f"adambridge_multi_step rejected a segment (code {rc})")
 
     def multi_apply(self, pool: int | None, segments: ctypes.Array, hparams: list, threads: int) -> None:
         """Like multi_step with explicit coefficients, one ``_HParams`` per segment."""
         hps = (_HParams * len(hparams))(*hparams)
-        rc = self._lib.adamx_multi_apply(pool, segments, hps, len(segments), threads)
+        rc = self._lib.adambridge_multi_apply(pool, segments, hps, len(segments), threads)
         if rc != 0:
-            raise RuntimeError(f"adamx_multi_apply rejected a segment (code {rc})")
+            raise RuntimeError(f"adambridge_multi_apply rejected a segment (code {rc})")
 
     @staticmethod
     def make_hparams(c: StepCoefficients, seed: int, stochastic: bool) -> _HParams:
@@ -342,7 +342,7 @@ class NativeKernels:
         mv_code = _DTYPE_CODES[m.dtype]
         g_code = _DTYPE_CODES[grad.dtype]
         o_code = DT_NONE if out is None else _DTYPE_CODES[out.dtype]
-        rc = self._lib.adamx_fused_adamw(
+        rc = self._lib.adambridge_fused_adamw(
             master.data_ptr() + lo * 4,
             grad.data_ptr() + lo * grad.element_size(),
             g_code,
@@ -356,7 +356,7 @@ class NativeKernels:
             ctypes.byref(hp),
         )
         if rc != 0:
-            raise RuntimeError(f"adamx_fused_adamw failed with code {rc}")
+            raise RuntimeError(f"adambridge_fused_adamw failed with code {rc}")
 
 
 _lock = threading.Lock()
@@ -367,7 +367,7 @@ _load_error: str | None = None
 def load(build_if_missing: bool = True) -> NativeKernels | None:
     """Return the native kernels, compiling them if needed; ``None`` if unavailable."""
     global _loaded, _load_error
-    if os.environ.get("ADAMX_DISABLE_NATIVE", "") not in ("", "0"):
+    if os.environ.get("ADAMBRIDGE_DISABLE_NATIVE", "") not in ("", "0"):
         return None
     with _lock:
         if _loaded is not None or _load_error is not None:
@@ -381,7 +381,7 @@ def load(build_if_missing: bool = True) -> NativeKernels | None:
             _loaded = NativeKernels(path)
         except (BuildError, OSError) as exc:
             _load_error = str(exc)
-            log.warning("adamx native kernels unavailable, using PyTorch kernels: %s", exc)
+            log.warning("adambridge native kernels unavailable, using PyTorch kernels: %s", exc)
         return _loaded
 
 
@@ -396,7 +396,7 @@ def load_error() -> str | None:
 def _main(argv: list[str]) -> int:
     import argparse
 
-    parser = argparse.ArgumentParser(prog="python -m adamx")
+    parser = argparse.ArgumentParser(prog="python -m adambridge")
     sub = parser.add_subparsers(dest="cmd", required=True)
     b = sub.add_parser("build", help="compile the kernel library")
     b.add_argument("--force", action="store_true")

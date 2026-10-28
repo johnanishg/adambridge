@@ -4,7 +4,7 @@ import io
 import pytest
 import torch
 
-import adamx
+import adambridge
 from conftest import BACKENDS, max_param_diff, tiny_mlp
 
 
@@ -36,7 +36,7 @@ def test_matches_torch_adamw_with_groups_and_scheduler(backend):
         ]
 
     ref = torch.optim.AdamW(groups(ref_model), lr=1e-2, betas=(0.8, 0.99))
-    opt = adamx.AdamX(groups(model), lr=1e-2, betas=(0.8, 0.99), backend=backend)
+    opt = adambridge.AdamBridge(groups(model), lr=1e-2, betas=(0.8, 0.99), backend=backend)
     sched_ref = torch.optim.lr_scheduler.StepLR(ref, step_size=3, gamma=0.5)
     sched = torch.optim.lr_scheduler.StepLR(opt, step_size=3, gamma=0.5)
     torch.manual_seed(1)
@@ -56,7 +56,7 @@ def test_cpu_bf16_params_use_fp32_master(backend):
     ref_model = tiny_mlp()
     model = copy.deepcopy(ref_model).to(torch.bfloat16)
     ref = torch.optim.AdamW(ref_model.parameters(), lr=1e-3)
-    opt = adamx.AdamX(model.parameters(), lr=1e-3, backend=backend)
+    opt = adambridge.AdamBridge(model.parameters(), lr=1e-3, backend=backend)
     torch.manual_seed(1)
     for _ in range(5):
         x = torch.randn(16, 48)
@@ -78,7 +78,7 @@ def test_params_without_grad_are_skipped():
     model = tiny_mlp()
     frozen = model[0].weight.detach().clone()
     model[0].weight.requires_grad_(False)
-    opt = adamx.AdamX(model.parameters(), lr=1e-2)
+    opt = adambridge.AdamBridge(model.parameters(), lr=1e-2)
     train(model, opt, 2)
     assert torch.equal(model[0].weight, frozen)
     assert opt.master_params()[0] is None
@@ -89,11 +89,11 @@ def test_state_dict_resume_is_exact():
     torch.manual_seed(0)
     base = tiny_mlp()
     a = copy.deepcopy(base)
-    opt_a = adamx.AdamX(a.parameters(), lr=1e-2, precision="bf16", seed=7)
+    opt_a = adambridge.AdamBridge(a.parameters(), lr=1e-2, precision="bf16", seed=7)
     train(a, opt_a, 6, seed=3)
 
     b = copy.deepcopy(base)
-    opt_b = adamx.AdamX(b.parameters(), lr=1e-2, precision="bf16", seed=7)
+    opt_b = adambridge.AdamBridge(b.parameters(), lr=1e-2, precision="bf16", seed=7)
     train(b, opt_b, 3, seed=3)
     buf = io.BytesIO()
     torch.save({"model": b.state_dict(), "opt": opt_b.state_dict()}, buf)
@@ -101,7 +101,7 @@ def test_state_dict_resume_is_exact():
     ckpt = torch.load(buf, weights_only=False)
 
     c = tiny_mlp(seed=123)  # different init, overwritten by the checkpoint
-    opt_c = adamx.AdamX(c.parameters(), lr=1e-2, precision="bf16", seed=7)
+    opt_c = adambridge.AdamBridge(c.parameters(), lr=1e-2, precision="bf16", seed=7)
     c.load_state_dict(ckpt["model"])
     opt_c.load_state_dict(ckpt["opt"])
     # continue with the same data stream as `a` after step 3
@@ -124,7 +124,7 @@ def test_load_torch_adamw_checkpoint(prec):
     ref = torch.optim.AdamW(ref_model.parameters(), lr=1e-2)
     train(ref_model, ref, 3)
     model = copy.deepcopy(ref_model)
-    opt = adamx.AdamX(model.parameters(), lr=1e-2, precision=prec)
+    opt = adambridge.AdamBridge(model.parameters(), lr=1e-2, precision=prec)
     opt.load_state_dict(ref.state_dict())
     for slot, p in zip(opt._ordered, ref_model.parameters()):
         assert slot.step == 3 and slot.m.precision == prec
@@ -142,7 +142,7 @@ def test_weights_loaded_after_construction_are_respected():
     """Master weights are created lazily, so loading pretrained weights after
     building the optimizer is not silently reverted on the first step."""
     model = tiny_mlp(seed=0)
-    opt = adamx.AdamX(model.parameters(), lr=0.0, weight_decay=0.0)
+    opt = adambridge.AdamBridge(model.parameters(), lr=0.0, weight_decay=0.0)
     pretrained = tiny_mlp(seed=42)
     model.load_state_dict(pretrained.state_dict())
     train(model, opt, 1)
@@ -153,7 +153,7 @@ def test_weights_loaded_after_construction_are_respected():
 @pytest.mark.parametrize("hooks", [False, True])
 def test_set_precision_mid_training(hooks):
     model = tiny_mlp()
-    opt = adamx.AdamX(model.parameters(), lr=1e-2)
+    opt = adambridge.AdamBridge(model.parameters(), lr=1e-2)
     if hooks:
         opt.attach_hooks(model)
     train(model, opt, 2, hooks=hooks)
@@ -176,7 +176,7 @@ def test_low_precision_moments_converge_like_fp32(prec):
     def run(precision):
         torch.manual_seed(1)
         lin = torch.nn.Linear(64, 16)
-        opt = adamx.AdamX(lin.parameters(), lr=1e-2, weight_decay=0.0, precision=precision)
+        opt = adambridge.AdamBridge(lin.parameters(), lr=1e-2, weight_decay=0.0, precision=precision)
         for i in range(1200):
             idx = torch.randint(0, 2048, (64,))
             opt.zero_grad()
@@ -193,7 +193,7 @@ def test_low_precision_moments_converge_like_fp32(prec):
 
 def test_double_backward_without_no_sync_raises():
     model = tiny_mlp()
-    opt = adamx.AdamX(model.parameters(), release_grads=False).attach_hooks(model)
+    opt = adambridge.AdamBridge(model.parameters(), release_grads=False).attach_hooks(model)
     x = torch.randn(4, 48)
     model(x).sum().backward()
     with pytest.raises(RuntimeError, match="no_sync"):
@@ -204,8 +204,8 @@ def test_double_backward_without_no_sync_raises():
 
 def test_hooks_on_cpu_match_step():
     a, b = tiny_mlp(), tiny_mlp()
-    opt_a = adamx.AdamX(a.parameters(), lr=1e-2)
-    opt_b = adamx.AdamX(b.parameters(), lr=1e-2).attach_hooks(b)
+    opt_a = adambridge.AdamBridge(a.parameters(), lr=1e-2)
+    opt_b = adambridge.AdamBridge(b.parameters(), lr=1e-2).attach_hooks(b)
     train(a, opt_a, 4)
     train(b, opt_b, 4, hooks=True)
     assert max_param_diff(a, b) == 0
@@ -216,7 +216,7 @@ def test_hooks_on_cpu_match_step():
 
 def test_worker_errors_surface_in_step():
     model = tiny_mlp()
-    opt = adamx.AdamX(model.parameters())
+    opt = adambridge.AdamBridge(model.parameters())
     model(torch.randn(2, 48)).sum().backward()
     opt.param_groups[0]["betas"] = None  # makes the worker's update raise
     with pytest.raises(RuntimeError, match="host update failed"):
@@ -228,7 +228,7 @@ def test_memory_report_and_backend():
     model = tiny_mlp()
     n = sum(p.numel() for p in model.parameters())
     for prec, per in (("fp32", 8), ("bf16", 4)):
-        opt = adamx.AdamX(model.parameters(), precision=prec)
+        opt = adambridge.AdamBridge(model.parameters(), precision=prec)
         train(model, opt, 1)
         rep = opt.memory_report()
         assert rep["master"] == 0  # CPU FP32 params are updated in place
@@ -238,4 +238,4 @@ def test_memory_report_and_backend():
 
 
 def test_alias():
-    assert adamx.OptiComputeAdamW is adamx.AdamX
+    assert adambridge.OptiComputeAdamW is adambridge.AdamBridge

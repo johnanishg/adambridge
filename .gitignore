@@ -6,4 +6,4 @@ build/
 dist/
 
 # Local test & report UI (personal workbench, not part of the library)
-adamx-lab/
+adambridge-lab/
