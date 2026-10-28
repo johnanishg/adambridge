@@ -4,8 +4,9 @@ Precision: after a warm-up, the tuner compares the host update time with the
 GPU backward time (first to last gradient-ready event). While the host is the
 bottleneck it steps the moment precision down one level (fp32 -> bf16 ->
 fp8) and keeps the change only if host time actually drops; otherwise it
-reverts and stops. A lower precision is not automatically faster: the
-native SIMD kernel handles fp32/bf16, while fp8 runs on the PyTorch kernel.
+reverts and stops. A lower precision moves fewer bytes but does more
+arithmetic per element (FP8 decodes, rescales and re-encodes every block),
+so the measurement, not the byte count, decides.
 
 Threads: a short micro-benchmark of the update kernel per compute pool,
 picking the fastest thread count (memory-bound kernels usually saturate

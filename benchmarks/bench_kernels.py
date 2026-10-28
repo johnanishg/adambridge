@@ -21,7 +21,8 @@ from adamx.precision import make_store
 
 
 def parse_numel(text: str) -> int:
-    mult = {"K": 1 << 10, "M": 1 << 20, "G": 1 << 30}
+    """'32M' -> 32,000,000 (decimal, as people read it)."""
+    mult = {"K": 10**3, "M": 10**6, "G": 10**9}
     return int(float(text[:-1]) * mult[text[-1].upper()]) if text[-1].upper() in mult else int(text)
 
 
@@ -91,8 +92,6 @@ def main():
     ]
     for backend in (["native"] if kernels else []) + ["torch"]:
         for precision, gdt, odt in configs:
-            if backend == "native" and precision == "fp8":
-                continue  # FP8 always runs on the PyTorch kernel
             label = f"adamx {backend:<6} moments={precision:<4} grad={str(gdt)[6:]:<8} out={str(odt)[6:] if odt else '-'}"
             t = bench_adamx(n, args.repeats, precision, backend, threads, gdt, odt)
             row(label, t, min_bytes(precision, 2 if gdt == torch.bfloat16 else 4, 2 if odt else 0))

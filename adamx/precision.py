@@ -197,6 +197,12 @@ class MomentStore(ABC):
         raise NotImplementedError
 
     @property
+    def native_buffers(self) -> tuple[torch.Tensor, torch.Tensor | None] | None:
+        """(codes or values, per-block scales or None) in the native kernel's
+        layout, or None if this store can only be updated by the PyTorch kernel."""
+        return None
+
+    @property
     def chunk_alignment(self) -> int:
         """``lo`` passed to ``read``/``write`` must be a multiple of this."""
         return 1
@@ -233,6 +239,10 @@ class FP32Store(MomentStore):
     def raw(self):
         return self.data
 
+    @property
+    def native_buffers(self):
+        return self.data, None
+
     def state_dict(self):
         return {"precision": "fp32", "data": self.data}
 
@@ -265,6 +275,10 @@ class BF16Store(MomentStore):
     @property
     def raw(self):
         return self.data
+
+    @property
+    def native_buffers(self):
+        return self.data, None
 
     def state_dict(self):
         return {"precision": "bf16", "data": self.data}
@@ -340,6 +354,11 @@ class FP8Store(MomentStore):
     @property
     def nbytes(self):
         return self.q.nbytes + self.scale.nbytes
+
+    @property
+    def native_buffers(self):
+        # The native kernel implements the 128-element block layout only.
+        return (self.q, self.scale) if self.block == FP8_BLOCK else None
 
     def state_dict(self):
         return {"precision": "fp8", "role": self.role, "block": self.block, "q": self.q, "scale": self.scale}

@@ -15,9 +15,18 @@
  *
  * This is the exact operation order of torch.optim.AdamW (decoupled weight
  * decay applied before the moment step, eps added after bias correction).
+ *
+ * Moments are stored as FP32, BF16, or FP8 (E4M3 m and E5M2 sqrt(v) with a
+ * scale per 128-element block). adamx_multi_step updates many tensors in one
+ * call on a persistent native thread pool, so per-tensor cost from Python is
+ * a pointer in an array rather than a thread hand-off.
  */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#  define _GNU_SOURCE 1  /* pthread_setaffinity_np */
+#endif
 #include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
@@ -49,9 +58,9 @@
 #  include <arm_neon.h>
 #endif
 
-#define ADAMX_ABI_VERSION 1
+#define ADAMX_ABI_VERSION 3
 
-enum { DT_NONE = 0, DT_F32 = 1, DT_BF16 = 2 };
+enum { DT_NONE = 0, DT_F32 = 1, DT_BF16 = 2, DT_FP8 = 3 };
 enum { SIMD_SCALAR = 0, SIMD_AVX2 = 1, SIMD_AVX512 = 2, SIMD_NEON = 3 };
 
 typedef struct adamx_hparams {
@@ -421,6 +430,71 @@ static void fused_neon(float* p, const void* g, int gt, void* m, void* v, int mv
 #endif /* ADAMX_NEON */
 
 /* ------------------------------------------------------------------------- */
+/* Threads, locks, atomics                                                   */
+/* ------------------------------------------------------------------------- */
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+typedef HANDLE ax_thread;
+typedef SRWLOCK ax_lock;
+typedef CONDITION_VARIABLE ax_cond;
+static void ax_lock_init(ax_lock* l) { InitializeSRWLock(l); }
+static void ax_lock_acquire(ax_lock* l) { AcquireSRWLockExclusive(l); }
+static void ax_lock_release(ax_lock* l) { ReleaseSRWLockExclusive(l); }
+static void ax_cond_init(ax_cond* c) { InitializeConditionVariable(c); }
+static void ax_cond_wait(ax_cond* c, ax_lock* l) { SleepConditionVariableSRW(c, l, INFINITE, 0); }
+static void ax_cond_broadcast(ax_cond* c) { WakeAllConditionVariable(c); }
+static void ax_yield(void) { SwitchToThread(); }
+#else
+#  include <pthread.h>
+#  include <sched.h>
+typedef pthread_t ax_thread;
+typedef pthread_mutex_t ax_lock;
+typedef pthread_cond_t ax_cond;
+static void ax_lock_init(ax_lock* l) { pthread_mutex_init(l, NULL); }
+static void ax_lock_acquire(ax_lock* l) { pthread_mutex_lock(l); }
+static void ax_lock_release(ax_lock* l) { pthread_mutex_unlock(l); }
+static void ax_cond_init(ax_cond* c) { pthread_cond_init(c, NULL); }
+static void ax_cond_wait(ax_cond* c, ax_lock* l) { pthread_cond_wait(c, l); }
+static void ax_cond_broadcast(ax_cond* c) { pthread_cond_broadcast(c); }
+static void ax_yield(void) { sched_yield(); }
+#endif
+
+#if defined(ADAMX_MSVC)
+static int32_t ax_load(volatile int32_t* p) { return (int32_t)InterlockedCompareExchange((volatile LONG*)p, 0, 0); }
+static void ax_store(volatile int32_t* p, int32_t v) { InterlockedExchange((volatile LONG*)p, (LONG)v); }
+static int32_t ax_fetch_add(volatile int32_t* p, int32_t v) { return (int32_t)InterlockedExchangeAdd((volatile LONG*)p, (LONG)v); }
+static int64_t ax_load64(volatile int64_t* p) { return InterlockedCompareExchange64(p, 0, 0); }
+static void ax_store64(volatile int64_t* p, int64_t v) { InterlockedExchange64(p, v); }
+#else
+static inline int32_t ax_load(volatile int32_t* p) { return __atomic_load_n(p, __ATOMIC_ACQUIRE); }
+static inline void ax_store(volatile int32_t* p, int32_t v) { __atomic_store_n(p, v, __ATOMIC_RELEASE); }
+static inline int32_t ax_fetch_add(volatile int32_t* p, int32_t v) { return __atomic_fetch_add(p, v, __ATOMIC_ACQ_REL); }
+static inline int64_t ax_load64(volatile int64_t* p) { return __atomic_load_n(p, __ATOMIC_ACQUIRE); }
+static inline void ax_store64(volatile int64_t* p, int64_t v) { __atomic_store_n(p, v, __ATOMIC_RELEASE); }
+#endif
+
+static inline void ax_relax(void)
+{
+#if defined(ADAMX_X86)
+    _mm_pause();
+#elif defined(__aarch64__) && !defined(_MSC_VER)
+    __asm__ __volatile__("yield");
+#endif
+}
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#  define AX_ALIGN64 __declspec(align(64))
+#else
+#  define AX_ALIGN64 __attribute__((aligned(64)))
+#endif
+
+/* ------------------------------------------------------------------------- */
 /* Runtime dispatch                                                          */
 /* ------------------------------------------------------------------------- */
 
@@ -450,14 +524,463 @@ static int detect_simd(void)
 
 static int g_detected = -1;
 static int g_active = -1;
+static volatile int32_t g_ready = 0;
+
+static void build_fp8_luts(void);
 
 static void ensure_init(void)
 {
-    if (g_detected < 0) {
-        g_detected = detect_simd();
-        g_active = g_detected;
+    if (ax_load(&g_ready)) return;
+    build_fp8_luts();   /* concurrent first calls compute identical tables */
+    g_detected = detect_simd();
+    g_active = g_detected;
+    ax_store(&g_ready, 1);
+}
+
+static void fused_dispatch(float* p, const void* g, int gt, void* m, void* v, int mvt,
+                           void* out, int ot, int64_t n, uint64_t off, const adamx_hparams* h)
+{
+    switch (g_active) {
+#if defined(ADAMX_X86)
+    case SIMD_AVX512: fused_avx512(p, g, gt, m, v, mvt, out, ot, n, off, h); break;
+    case SIMD_AVX2:   fused_avx2(p, g, gt, m, v, mvt, out, ot, n, off, h); break;
+#endif
+#if defined(ADAMX_NEON)
+    case SIMD_NEON:   fused_neon(p, g, gt, m, v, mvt, out, ot, n, off, h); break;
+#endif
+    default:          fused_scalar(p, g, gt, m, v, mvt, out, ot, n, off, h); break;
     }
 }
+
+/* ------------------------------------------------------------------------- */
+/* Segments: one tensor's buffers plus its parameter group                   */
+/* ------------------------------------------------------------------------- */
+
+typedef struct adamx_group {
+    double lr;
+    double beta1;
+    double beta2;
+    double eps;
+    double weight_decay;
+    uint64_t seed;       /* base seed for stochastic rounding */
+    int32_t stochastic;
+    int32_t reserved;
+} adamx_group;
+
+typedef struct adamx_segment {
+    float* p;                /* FP32 master weights */
+    const void* g;           /* gradient (g_dtype) */
+    void* m;                 /* first moment (mv_dtype; FP8: E4M3 codes) */
+    void* v;                 /* second moment (mv_dtype; FP8: E5M2 codes of sqrt(v)) */
+    float* m_scale;          /* FP8 only: one scale per 128 elements */
+    float* v_scale;
+    void* out;               /* optional copy of p in out_dtype (write-back buffer) */
+    const adamx_group* group;
+    int64_t n;
+    int64_t step;            /* step number of this update (caller increments) */
+    uint64_t index;          /* parameter index, selects the rounding stream */
+    int64_t offset;          /* element offset of p[0] within the parameter: a chunk of a tensor
+                                draws the same rounding bits as the whole tensor would
+                                (a multiple of 128 for FP8 moments, whose scales are per block) */
+    int32_t g_dtype;
+    int32_t mv_dtype;
+    int32_t out_dtype;
+    int32_t reserved;
+} adamx_segment;
+
+/* Same mixing as adamx.kernels.mix_seed(seed, index, step). */
+static uint64_t mix64(uint64_t h, uint64_t v)
+{
+    h = (h ^ v) * 0xBF58476D1CE4E5B9ULL;
+    h ^= h >> 31;
+    h *= 0x94D049BB133111EBULL;
+    h ^= h >> 29;
+    return h;
+}
+
+static uint32_t step_seed(uint64_t base, uint64_t index, int64_t step)
+{
+    uint64_t h = 0x9E3779B97F4A7C15ULL;
+    h = mix64(h, base);
+    h = mix64(h, index);
+    h = mix64(h, (uint64_t)step);
+    return (uint32_t)h;
+}
+
+/* The per-step scalars, computed in double like adamx.kernels.StepCoefficients. */
+static void hparams_for(const adamx_segment* s, adamx_hparams* h)
+{
+    const adamx_group* G = s->group;
+    const double t = (double)s->step;
+    const double bc1 = 1.0 - pow(G->beta1, t);
+    const double bc2 = 1.0 - pow(G->beta2, t);
+    h->beta1 = (float)G->beta1;
+    h->beta2 = (float)G->beta2;
+    h->one_minus_beta1 = (float)(1.0 - G->beta1);
+    h->one_minus_beta2 = (float)(1.0 - G->beta2);
+    h->decay = (float)(1.0 - G->lr * G->weight_decay);
+    h->step_size = (float)(G->lr / bc1);
+    h->inv_sqrt_bc2 = (float)(1.0 / sqrt(bc2));
+    h->eps = (float)G->eps;
+    h->seed = step_seed(G->seed, s->index, s->step);
+    h->stochastic = G->stochastic;
+}
+
+/* ------------------------------------------------------------------------- */
+/* FP8 moments                                                               */
+/*                                                                           */
+/* m is stored as E4M3 (the "fn" variant: no infinities, max 448) and        */
+/* sqrt(v) as E5M2 (max 57344), each with one FP32 scale per 128-element     */
+/* block: scale = block absmax / format max. Layout, arithmetic and the      */
+/* stochastic-rounding stream match adamx.precision.FP8Store, so this        */
+/* kernel and the PyTorch one make the same rounding decisions.              */
+/* ------------------------------------------------------------------------- */
+
+#define FP8_BLOCK 128
+
+static float g_lut_e4m3[256];
+static float g_lut_e5m2[256];
+
+static float fp8_decode(uint32_t c, int mbits, int bias, int ieee_specials)
+{
+    const uint32_t sign = (c & 0x80u) << 24;
+    const int ebits = 7 - mbits;
+    const uint32_t emax = (1u << ebits) - 1u;
+    const uint32_t e = (c >> mbits) & emax;
+    const uint32_t m = c & ((1u << mbits) - 1u);
+    if (ieee_specials) {                       /* E5M2: top exponent is inf/NaN */
+        if (e == emax) return bits_f32(sign | (m ? 0x7fc00000u : 0x7f800000u));
+    } else if (e == emax && m == (1u << mbits) - 1u) {
+        return bits_f32(sign | 0x7fc00000u);   /* E4M3fn: only S.1111.111 is NaN */
+    }
+    if (e == 0) {                              /* subnormal: m * 2^(1 - bias - mbits) */
+        const float mag = (float)m * bits_f32((uint32_t)(127 + 1 - bias - mbits) << 23);
+        return bits_f32(sign | f32_bits(mag));
+    }
+    return bits_f32(sign | ((uint32_t)((int)e - bias + 127) << 23) | (m << (23 - mbits)));
+}
+
+static void build_fp8_luts(void)
+{
+    for (uint32_t c = 0; c < 256; ++c) {
+        g_lut_e4m3[c] = fp8_decode(c, 3, 7, 0);
+        g_lut_e5m2[c] = fp8_decode(c, 2, 15, 1);
+    }
+}
+
+/* fp32 -> FP8 code, exactly as adamx.precision does it: optional stochastic
+ * truncation of the fp32 bits to the format's mantissa width, clamp to the
+ * format max, then round-to-nearest-even into the format. Branch-free so the
+ * per-block loops vectorize. */
+static inline uint32_t fp8_encode(float x, int sr, uint32_t r, int mbits, int bias, float fmax, uint32_t nan_code)
+{
+    const int drop = 23 - mbits;
+    const uint32_t low = (1u << drop) - 1u;
+    const uint32_t b = f32_bits(x);
+    const uint32_t sign = (b >> 24) & 0x80u;
+    const int is_nan = (b & 0x7fffffffu) > 0x7f800000u;
+    const uint32_t t = sr ? ((b + (r & low)) & ~low) : b;
+    float a = bits_f32(t & 0x7fffffffu);
+    a = a > fmax ? fmax : a;
+    const uint32_t ab = f32_bits(a);
+    const uint32_t rn = sr ? ab : ab + (low >> 1) + ((ab >> drop) & 1u);
+    const uint32_t normal = ((((rn >> 23) & 0xffu) + (uint32_t)(bias - 127)) << mbits) |
+                            ((rn >> drop) & ((1u << mbits) - 1u));
+    const float sub_scale = bits_f32((uint32_t)(127 + bias + mbits - 1) << 23);
+    const uint32_t sub = f32_bits(a * sub_scale + 8388608.0f) - 0x4b000000u;  /* RNE to integer */
+    const float min_normal = bits_f32((uint32_t)(127 + 1 - bias) << 23);
+    const uint32_t code = a >= min_normal ? normal : sub;
+    return sign | (is_nan ? nan_code : code);
+}
+
+/* One segment range [lo, hi): lo is a multiple of FP8_BLOCK, hi is a multiple
+ * or the end of the segment. Each block is decoded to FP32, updated by the
+ * regular SIMD kernel, re-scaled and re-encoded. */
+#define FP8_RANGE_BODY(FUSED)                                                                    \
+{                                                                                                \
+    AX_ALIGN64 float mt[FP8_BLOCK];                                                              \
+    AX_ALIGN64 float vt[FP8_BLOCK];                                                              \
+    uint8_t* mq = (uint8_t*)s->m;                                                                \
+    uint8_t* vq = (uint8_t*)s->v;                                                                \
+    const uint32_t s_m = h->seed, s_v = seed_v_of(h->seed);                                      \
+    const int sr = h->stochastic;                                                                \
+    for (int64_t b0 = lo; b0 < hi; b0 += FP8_BLOCK) {                                           \
+        const int nb = (int)(hi - b0 < FP8_BLOCK ? hi - b0 : FP8_BLOCK);                         \
+        const int64_t blk = b0 / FP8_BLOCK;                                                      \
+        const float sm = s->m_scale[blk], sv = s->v_scale[blk];                                  \
+        for (int k = 0; k < nb; ++k) mt[k] = g_lut_e4m3[mq[b0 + k]] * sm;                        \
+        for (int k = 0; k < nb; ++k) { const float u = g_lut_e5m2[vq[b0 + k]] * sv; vt[k] = u * u; } \
+        FUSED(s->p + b0, cadv(s->g, s->g_dtype, b0), s->g_dtype, mt, vt, DT_F32,                \
+              adv(s->out, s->out_dtype, b0), s->out_dtype, nb, (uint64_t)(s->offset + b0), h);  \
+        float am = 0.0f, au = 0.0f;                                                              \
+        for (int k = 0; k < nb; ++k) {                                                           \
+            const float a = fabsf(mt[k]);                                                        \
+            const float u = sqrtf(vt[k] > 0.0f ? vt[k] : 0.0f);                                  \
+            vt[k] = u;                                                                           \
+            am = a > am ? a : am;                                                                \
+            au = u > au ? u : au;                                                                \
+        }                                                                                        \
+        const float scm = am > 0.0f ? am / 448.0f : 1.0f;                                        \
+        const float scu = au > 0.0f ? au / 57344.0f : 1.0f;                                      \
+        for (int k = 0; k < nb; ++k) {                                                           \
+            const uint32_t idx = (uint32_t)(s->offset + b0 + k);                                 \
+            mq[b0 + k] = (uint8_t)fp8_encode(mt[k] / scm, sr, hash32(idx ^ s_m), 3, 7, 448.0f, 0x7fu); \
+            vq[b0 + k] = (uint8_t)fp8_encode(vt[k] / scu, sr, hash32(idx ^ s_v), 2, 15, 57344.0f, 0x7eu); \
+        }                                                                                        \
+        for (int k = nb; k < FP8_BLOCK; ++k) { mq[b0 + k] = 0; vq[b0 + k] = 0; }               \
+        s->m_scale[blk] = scm;                                                                   \
+        s->v_scale[blk] = scu;                                                                   \
+    }                                                                                            \
+}
+
+static void fp8_range_scalar(const adamx_segment* s, const adamx_hparams* h, int64_t lo, int64_t hi)
+FP8_RANGE_BODY(fused_scalar)
+
+#if defined(ADAMX_X86)
+ADAMX_TARGET("avx2,fma")
+static void fp8_range_avx2(const adamx_segment* s, const adamx_hparams* h, int64_t lo, int64_t hi)
+FP8_RANGE_BODY(fused_avx2)
+
+ADAMX_TARGET(ADAMX_AVX512)
+static void fp8_range_avx512(const adamx_segment* s, const adamx_hparams* h, int64_t lo, int64_t hi)
+FP8_RANGE_BODY(fused_avx512)
+#endif
+
+#if defined(ADAMX_NEON)
+static void fp8_range_neon(const adamx_segment* s, const adamx_hparams* h, int64_t lo, int64_t hi)
+FP8_RANGE_BODY(fused_neon)
+#endif
+
+static void fp8_dispatch(const adamx_segment* s, const adamx_hparams* h, int64_t lo, int64_t hi)
+{
+    switch (g_active) {
+#if defined(ADAMX_X86)
+    case SIMD_AVX512: fp8_range_avx512(s, h, lo, hi); break;
+    case SIMD_AVX2:   fp8_range_avx2(s, h, lo, hi); break;
+#endif
+#if defined(ADAMX_NEON)
+    case SIMD_NEON:   fp8_range_neon(s, h, lo, hi); break;
+#endif
+    default:          fp8_range_scalar(s, h, lo, hi); break;
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Work items and the thread pool                                            */
+/* ------------------------------------------------------------------------- */
+
+typedef struct ax_item {
+    const adamx_segment* seg;
+    const adamx_hparams* h;
+    int64_t lo;
+    int64_t hi;
+} ax_item;
+
+typedef struct ax_job {
+    const ax_item* items;
+    int32_t nitems;
+} ax_job;
+
+static void run_item(const ax_item* it)
+{
+    const adamx_segment* s = it->seg;
+    const int64_t lo = it->lo;
+    if (s->mv_dtype == DT_FP8) {
+        fp8_dispatch(s, it->h, lo, it->hi);
+        return;
+    }
+    fused_dispatch(s->p + lo, cadv(s->g, s->g_dtype, lo), s->g_dtype,
+                   adv(s->m, s->mv_dtype, lo), adv(s->v, s->mv_dtype, lo), s->mv_dtype,
+                   adv(s->out, s->out_dtype, lo), s->out_dtype, it->hi - lo, (uint64_t)(s->offset + lo), it->h);
+}
+
+typedef struct adamx_pool adamx_pool;
+
+typedef struct ax_helper {
+    adamx_pool* pool;
+    int32_t id;              /* 1 .. nthreads-1; the calling thread is 0 */
+    ax_lock lock;            /* each helper sleeps on its own cv, so a job */
+    ax_cond cv;              /* wakes only the helpers it needs */
+} ax_helper;
+
+struct adamx_pool {
+    int32_t nthreads;        /* helpers + the calling thread */
+    ax_thread* threads;
+    ax_helper* helpers;
+    int32_t* cpus;           /* affinity set for helpers (may be empty) */
+    int32_t ncpus;
+    ax_lock run_lock;        /* one job at a time */
+    volatile int64_t ticket; /* (generation << 32) | helpers taking part */
+    volatile int32_t remaining;
+    volatile int32_t next;
+    volatile int32_t stop;
+    int32_t spin;
+    int64_t generation;
+    const ax_job* job;
+};
+
+static void pool_work(adamx_pool* P, const ax_job* job)
+{
+    for (;;) {
+        const int32_t i = ax_fetch_add(&P->next, 1);
+        if (i >= job->nitems) return;
+        run_item(&job->items[i]);
+    }
+}
+
+static void pin_current_thread(const adamx_pool* P)
+{
+    if (P->ncpus <= 0) return;
+#if defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (int32_t i = 0; i < P->ncpus; ++i)
+        if (P->cpus[i] >= 0 && P->cpus[i] < CPU_SETSIZE) CPU_SET(P->cpus[i], &set);
+    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#elif defined(_WIN32)
+    DWORD_PTR mask = 0;
+    for (int32_t i = 0; i < P->ncpus; ++i)
+        if (P->cpus[i] >= 0 && P->cpus[i] < (int32_t)(8 * sizeof(DWORD_PTR))) mask |= (DWORD_PTR)1 << P->cpus[i];
+    if (mask) SetThreadAffinityMask(GetCurrentThread(), mask);
+#endif
+}
+
+/* True when ticket t is a job this helper takes part in. Participation and
+ * generation come from one atomic snapshot, so a late helper can never act
+ * on another job's helper count. */
+static inline int wanted(const ax_helper* me, int64_t t) { return me->id <= (int32_t)(t & 0xffffffff); }
+
+static void helper_main(ax_helper* me)
+{
+    adamx_pool* P = me->pool;
+    pin_current_thread(P);
+    /* The ticket the pool was created with (no job yet), not the current one: a
+     * job posted before this thread got to run must still be seen as new. */
+    int64_t seen = 0;
+    int32_t spin = 0;                    /* spin only right after real work */
+    for (;;) {
+        int64_t t;
+        for (;;) {
+            if (ax_load(&P->stop)) return;
+            t = ax_load64(&P->ticket);
+            if (t != seen) {
+                seen = t;
+                if (wanted(me, t)) break;
+                continue;                /* a job for other helpers: keep waiting */
+            }
+            if (spin > 0) { --spin; ax_relax(); continue; }
+            ax_lock_acquire(&me->lock);
+            while (ax_load64(&P->ticket) == seen && !ax_load(&P->stop)) ax_cond_wait(&me->cv, &me->lock);
+            ax_lock_release(&me->lock);
+        }
+        pool_work(P, P->job);
+        ax_fetch_add(&P->remaining, -1);
+        spin = P->spin;
+    }
+}
+
+#if defined(_WIN32)
+static DWORD WINAPI helper_entry(LPVOID arg) { helper_main((ax_helper*)arg); return 0; }
+#else
+static void* helper_entry(void* arg) { helper_main((ax_helper*)arg); return NULL; }
+#endif
+
+static void pool_run(adamx_pool* P, const ax_job* job, int32_t threads)
+{
+    if (!P || threads <= 1 || job->nitems <= 1 || P->nthreads <= 1) {
+        for (int32_t i = 0; i < job->nitems; ++i) run_item(&job->items[i]);
+        return;
+    }
+    ax_lock_acquire(&P->run_lock);
+    int32_t helpers = threads - 1;
+    if (helpers > P->nthreads - 1) helpers = P->nthreads - 1;
+    if (helpers > job->nitems - 1) helpers = job->nitems - 1;
+    P->job = job;
+    ax_store(&P->next, 0);
+    ax_store(&P->remaining, helpers);
+    P->generation += 1;
+    ax_store64(&P->ticket, (P->generation << 32) | (int64_t)helpers);
+    for (int32_t i = 0; i < helpers; ++i) {  /* wake exactly the helpers taking part */
+        ax_helper* h = &P->helpers[i];
+        ax_lock_acquire(&h->lock);
+        ax_cond_broadcast(&h->cv);
+        ax_lock_release(&h->lock);
+    }
+    pool_work(P, job);
+    for (int32_t spins = 0; ax_load(&P->remaining) > 0; ++spins) {
+        if (spins < (1 << 16)) ax_relax();
+        else ax_yield();
+    }
+    ax_lock_release(&P->run_lock);
+}
+
+/* Threads that update segments: `nthreads` includes the calling thread, so
+ * nthreads - 1 helpers are started. cpus (may be NULL) pins the helpers. */
+ADAMX_API void* adamx_pool_create(int32_t nthreads, const int32_t* cpus, int32_t ncpus)
+{
+    ensure_init();
+    if (nthreads < 1) nthreads = 1;
+    adamx_pool* P = (adamx_pool*)calloc(1, sizeof(adamx_pool));
+    if (!P) return NULL;
+    P->nthreads = nthreads;
+    P->spin = 4000;
+    ax_lock_init(&P->run_lock);
+    if (cpus && ncpus > 0) {
+        P->cpus = (int32_t*)malloc(sizeof(int32_t) * (size_t)ncpus);
+        if (P->cpus) { memcpy(P->cpus, cpus, sizeof(int32_t) * (size_t)ncpus); P->ncpus = ncpus; }
+    }
+    if (nthreads > 1) {
+        P->threads = (ax_thread*)calloc((size_t)nthreads - 1, sizeof(ax_thread));
+        P->helpers = (ax_helper*)calloc((size_t)nthreads - 1, sizeof(ax_helper));
+        if (!P->threads || !P->helpers) { P->nthreads = 1; return P; }
+        for (int32_t i = 0; i < nthreads - 1; ++i) {
+            P->helpers[i].pool = P;
+            P->helpers[i].id = i + 1;
+            ax_lock_init(&P->helpers[i].lock);
+            ax_cond_init(&P->helpers[i].cv);
+#if defined(_WIN32)
+            P->threads[i] = CreateThread(NULL, 0, helper_entry, &P->helpers[i], 0, NULL);
+            if (!P->threads[i]) { P->nthreads = i + 1; break; }
+#else
+            if (pthread_create(&P->threads[i], NULL, helper_entry, &P->helpers[i]) != 0) { P->nthreads = i + 1; break; }
+#endif
+        }
+    }
+    return P;
+}
+
+ADAMX_API void adamx_pool_destroy(void* pool)
+{
+    adamx_pool* P = (adamx_pool*)pool;
+    if (!P) return;
+    ax_store(&P->stop, 1);
+    for (int32_t i = 0; i < P->nthreads - 1; ++i) {
+        ax_lock_acquire(&P->helpers[i].lock);
+        ax_cond_broadcast(&P->helpers[i].cv);
+        ax_lock_release(&P->helpers[i].lock);
+    }
+    for (int32_t i = 0; i < P->nthreads - 1; ++i) {
+#if defined(_WIN32)
+        WaitForSingleObject(P->threads[i], INFINITE);
+        CloseHandle(P->threads[i]);
+#else
+        pthread_join(P->threads[i], NULL);
+#endif
+    }
+    free(P->threads);
+    free(P->helpers);
+    free(P->cpus);
+    free(P);
+}
+
+ADAMX_API int32_t adamx_pool_threads(void* pool) { return pool ? ((adamx_pool*)pool)->nthreads : 1; }
+
+/* How long helpers spin (in pause instructions) before sleeping between jobs. */
+ADAMX_API void adamx_pool_set_spin(void* pool, int32_t spin) { if (pool) ((adamx_pool*)pool)->spin = spin < 0 ? 0 : spin; }
+
+/* ------------------------------------------------------------------------- */
+/* Public entry points                                                       */
+/* ------------------------------------------------------------------------- */
 
 ADAMX_API int adamx_abi_version(void) { return ADAMX_ABI_VERSION; }
 
@@ -479,8 +1002,11 @@ ADAMX_API int adamx_set_simd_level(int level)
 }
 
 ADAMX_API int adamx_hparams_size(void) { return (int)sizeof(adamx_hparams); }
+ADAMX_API int adamx_group_size(void) { return (int)sizeof(adamx_group); }
+ADAMX_API int adamx_segment_size(void) { return (int)sizeof(adamx_segment); }
 
-/* Returns 0 on success, negative on invalid arguments. */
+/* Returns 0 on success, negative on invalid arguments. Single-threaded,
+ * FP32/BF16 moments only (kept for tests and simple callers). */
 ADAMX_API int adamx_fused_adamw(float* p, const void* g, int g_dtype,
                                 void* m, void* v, int mv_dtype,
                                 void* out, int out_dtype,
@@ -496,15 +1022,101 @@ ADAMX_API int adamx_fused_adamw(float* p, const void* g, int g_dtype,
     if (out_dtype == DT_NONE) out = NULL;
 
     ensure_init();
-    switch (g_active) {
-#if defined(ADAMX_X86)
-    case SIMD_AVX512: fused_avx512(p, g, g_dtype, m, v, mv_dtype, out, out_dtype, n, offset, hp); break;
-    case SIMD_AVX2:   fused_avx2(p, g, g_dtype, m, v, mv_dtype, out, out_dtype, n, offset, hp); break;
-#endif
-#if defined(ADAMX_NEON)
-    case SIMD_NEON:   fused_neon(p, g, g_dtype, m, v, mv_dtype, out, out_dtype, n, offset, hp); break;
-#endif
-    default:          fused_scalar(p, g, g_dtype, m, v, mv_dtype, out, out_dtype, n, offset, hp); break;
-    }
+    fused_dispatch(p, g, g_dtype, m, v, mv_dtype, out, out_dtype, n, offset, hp);
     return 0;
+}
+
+static int check_segment(const adamx_segment* s, int need_group)
+{
+    if (!s || s->n < 0) return -1;
+    if (s->n == 0) return 0;
+    if (!s->p || !s->g || !s->m || !s->v) return -2;
+    if (s->g_dtype != DT_F32 && s->g_dtype != DT_BF16) return -3;
+    if (s->mv_dtype != DT_F32 && s->mv_dtype != DT_BF16 && s->mv_dtype != DT_FP8) return -4;
+    if (s->out_dtype != DT_NONE && s->out_dtype != DT_F32 && s->out_dtype != DT_BF16) return -5;
+    if (s->out_dtype != DT_NONE && !s->out) return -6;
+    if (s->mv_dtype == DT_FP8 && (!s->m_scale || !s->v_scale)) return -7;
+    if (need_group && !s->group) return -8;
+    if (s->offset < 0 || (s->mv_dtype == DT_FP8 && s->offset % FP8_BLOCK)) return -11;
+    return 0;
+}
+
+/* Split segments into work items: about 4 per thread for load balance, never
+ * smaller than 32K elements, always starting on a 128-element boundary (the
+ * FP8 block; also keeps the SIMD/tail split independent of the thread count). */
+#define AX_MIN_PIECE 32768
+
+static int run_segments(adamx_pool* P, adamx_segment* const* segs, const adamx_hparams* hps,
+                        int32_t nsegs, int32_t threads)
+{
+    if (threads <= 0) threads = P ? P->nthreads : 1;
+    int64_t total = 0;
+    for (int32_t i = 0; i < nsegs; ++i) {
+        const int64_t n = segs[i]->n;
+        if (n <= 0) continue;
+        int64_t piece = (n + (int64_t)threads * 4 - 1) / ((int64_t)threads * 4);
+        piece = (piece + FP8_BLOCK - 1) / FP8_BLOCK * FP8_BLOCK;
+        if (piece < AX_MIN_PIECE) piece = AX_MIN_PIECE;
+        total += (n + piece - 1) / piece;
+    }
+    if (total == 0) return 0;
+    if (total > 0x7fffffff) return -9;
+    ax_item* items = (ax_item*)malloc(sizeof(ax_item) * (size_t)total);
+    if (!items) return -10;
+    int32_t k = 0;
+    for (int32_t i = 0; i < nsegs; ++i) {
+        const int64_t n = segs[i]->n;
+        if (n <= 0) continue;
+        int64_t piece = (n + (int64_t)threads * 4 - 1) / ((int64_t)threads * 4);
+        piece = (piece + FP8_BLOCK - 1) / FP8_BLOCK * FP8_BLOCK;
+        if (piece < AX_MIN_PIECE) piece = AX_MIN_PIECE;
+        for (int64_t lo = 0; lo < n; lo += piece) {
+            items[k].seg = segs[i];
+            items[k].h = &hps[i];
+            items[k].lo = lo;
+            items[k].hi = lo + piece < n ? lo + piece : n;
+            ++k;
+        }
+    }
+    ax_job job = { items, k };
+    pool_run(P, &job, threads < k ? threads : k);
+    free(items);
+    return 0;
+}
+
+/* Update `nsegs` segments, parallel over `threads` threads of `pool` (NULL:
+ * the calling thread only). Each segment's coefficients come from its group
+ * and its step field, which the caller sets to this update's step number.
+ * Validates every segment first; on error nothing is updated and the
+ * negative code of the first bad segment is returned. */
+ADAMX_API int adamx_multi_step(void* pool, adamx_segment* const* segs, int32_t nsegs, int32_t threads)
+{
+    if (nsegs <= 0) return 0;
+    if (!segs) return -1;
+    ensure_init();
+    for (int32_t i = 0; i < nsegs; ++i) {
+        const int rc = check_segment(segs[i], 1);
+        if (rc) return rc;
+    }
+    adamx_hparams* hps = (adamx_hparams*)malloc(sizeof(adamx_hparams) * (size_t)nsegs);
+    if (!hps) return -10;
+    for (int32_t i = 0; i < nsegs; ++i) hparams_for(segs[i], &hps[i]);
+    const int rc = run_segments((adamx_pool*)pool, segs, hps, nsegs, threads);
+    free(hps);
+    return rc;
+}
+
+/* Same as adamx_multi_step with caller-supplied coefficients (hps[i] for
+ * segs[i]); groups and steps are ignored. Used by tests and benchmarks. */
+ADAMX_API int adamx_multi_apply(void* pool, adamx_segment* const* segs, const adamx_hparams* hps,
+                                int32_t nsegs, int32_t threads)
+{
+    if (nsegs <= 0) return 0;
+    if (!segs || !hps) return -1;
+    ensure_init();
+    for (int32_t i = 0; i < nsegs; ++i) {
+        const int rc = check_segment(segs[i], 0);
+        if (rc) return rc;
+    }
+    return run_segments((adamx_pool*)pool, segs, hps, nsegs, threads);
 }

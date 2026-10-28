@@ -100,6 +100,36 @@ def test_native_and_torch_make_the_same_rounding_decisions():
         assert (x == y).float().mean().item() > 0.99
 
 
+@needs_native
+@pytest.mark.parametrize("stochastic", [False, True])
+@pytest.mark.parametrize("out_dtype", [None, torch.bfloat16])
+def test_native_fp8_matches_torch_fp8(stochastic, out_dtype):
+    """The native FP8 kernel and the PyTorch FP8 path share layout, arithmetic
+    and the stochastic-rounding stream: same weights, (almost) the same codes."""
+    c = StepCoefficients.for_step(1e-3, 0.9, 0.999, 1e-8, 0.01, 3)
+    results = []
+    for backend in ("native", "torch"):
+        eng = UpdateEngine(precision="fp8", backend=backend, numa_aware=False, stochastic_rounding=stochastic)
+        try:
+            pool = eng.ensure_pool(torch.device("cpu"))
+            master, grad, m, v, out = make_inputs("fp8", torch.bfloat16, out_dtype)
+            for _ in range(3):  # several steps, so block scales evolve
+                eng.run_kernel(master, grad, m, v, out, c, 1234, pool)
+            results.append((master, m, v, out))
+        finally:
+            eng.close()
+    (pa, ma, va, oa), (pb, mb, vb, ob) = results
+    torch.testing.assert_close(pa, pb, rtol=1e-5, atol=1e-6)
+    # FMA vs separate multiply-add can move a pre-rounding value across a
+    # rounding boundary; everything else must agree exactly.
+    assert (ma.q.view(torch.uint8) == mb.q.view(torch.uint8)).float().mean().item() > 0.99
+    assert (va.q.view(torch.uint8) == vb.q.view(torch.uint8)).float().mean().item() > 0.99
+    torch.testing.assert_close(ma.scale, mb.scale, rtol=1e-5, atol=0)
+    torch.testing.assert_close(va.scale, vb.scale, rtol=1e-5, atol=0)
+    if out_dtype is not None:
+        assert torch.equal(oa, pa.to(out_dtype))
+
+
 @pytest.mark.parametrize("backend", ["torch"] + (["native"] if NATIVE else []))
 @pytest.mark.parametrize("prec", ["fp32", "bf16", "fp8"])
 def test_results_independent_of_thread_count(backend, prec):

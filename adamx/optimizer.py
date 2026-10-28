@@ -11,7 +11,7 @@ from typing import Any, Callable, Iterable
 import torch
 
 from . import autotune as _autotune
-from .engine import ParamSlot, StepStats, UpdateEngine
+from .engine import ParamSlot, SmallGroup, StepStats, UpdateEngine
 from .precision import bytes_per_param, canonical_precision, make_store, store_from_state_dict
 
 __all__ = ["AdamX", "OptiComputeAdamW"]
@@ -72,6 +72,11 @@ class AdamX(torch.optim.Optimizer):
         autotune: ``True`` or an :class:`~adamx.autotune.AutoTuneConfig` to
             tune thread count and moment precision at runtime.
         seed: base seed for stochastic rounding.
+        small_param_threshold: CUDA parameters with fewer elements (norms,
+            biases) get no per-tensor hook; they are updated together at
+            :meth:`step_sync` with one transfer each way. Their update takes
+            microseconds, so overlapping it with backward gains nothing, while a
+            hook per tensor costs tens of microseconds of Python each.
     """
 
     def __init__(
@@ -92,6 +97,7 @@ class AdamX(torch.optim.Optimizer):
         overlap_writeback: bool = True,
         autotune: bool | _autotune.AutoTuneConfig = False,
         seed: int = 0,
+        small_param_threshold: int = 65536,
     ):
         if not 0.0 <= lr:
             raise ValueError(f"invalid learning rate: {lr}")
@@ -106,6 +112,7 @@ class AdamX(torch.optim.Optimizer):
 
         self.precision = canonical_precision(precision)
         self.release_grads = release_grads
+        self.small_param_threshold = small_param_threshold
         self._slots: dict[torch.Tensor, ParamSlot] = {}
         self._ordered: list[ParamSlot] = []
         self._hooks: list[torch.utils.hooks.RemovableHandle] = []
@@ -130,6 +137,7 @@ class AdamX(torch.optim.Optimizer):
             timing=self._tuner is not None,
         )
         self._finalizer = weakref.finalize(self, UpdateEngine.close, self._engine)
+        self._small_groups = self._build_small_groups()
 
     # ---------------------------------------------------------------- groups
 
@@ -144,6 +152,15 @@ class AdamX(torch.optim.Optimizer):
             self._ordered.append(slot)
             if self._hooked and p.requires_grad:
                 self._hooks.append(p.register_post_accumulate_grad_hook(self._on_grad_ready))
+
+    def _build_small_groups(self) -> list[SmallGroup]:
+        """Group small CUDA parameters by device and dtype (before any state exists)."""
+        by_key: dict[tuple, list[ParamSlot]] = {}
+        for slot in self._ordered:
+            p = slot.param
+            if p.is_cuda and p.requires_grad and slot.numel < self.small_param_threshold:
+                by_key.setdefault((p.device, p.dtype), []).append(slot)
+        return [SmallGroup(slots) for slots in by_key.values()]
 
     def _rebind_groups(self) -> None:
         for group in self.param_groups:
@@ -162,7 +179,7 @@ class AdamX(torch.optim.Optimizer):
         wanted = None if model is None else {id(p) for p in model.parameters()}
         for slot in self._ordered:
             p = slot.param
-            if p.requires_grad and (wanted is None or id(p) in wanted):
+            if p.requires_grad and slot.small is None and (wanted is None or id(p) in wanted):
                 self._hooks.append(p.register_post_accumulate_grad_hook(self._on_grad_ready))
         self._hooked = True
         return self
@@ -200,10 +217,22 @@ class AdamX(torch.optim.Optimizer):
         slot.submitted = True
         self._engine.submit(slot, grad)
 
+    def _flush_small(self, release: bool) -> None:
+        """Queue the small parameters' updates, one transfer per group."""
+        for group in self._small_groups:
+            grads = [None if s.submitted else s.param.grad for s in group.slots]
+            for slot in self._engine.submit_small(group, grads):
+                slot.submitted = True
+                if release:
+                    slot.param.grad = None
+
     def step_sync(self) -> StepStats:
-        """Wait for all queued host updates and order the weight write-backs
-        before subsequent work on the current CUDA stream."""
+        """Update the small parameters, wait for all queued host updates, and
+        order the weight write-backs before subsequent work on the current
+        CUDA stream."""
         try:
+            if not self._accumulating:
+                self._flush_small(release=self.release_grads and self._hooked)
             stats = self._engine.finish_step()
         finally:
             for slot in self._ordered:
@@ -224,8 +253,9 @@ class AdamX(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
         for slot in self._ordered:
-            if not slot.submitted and slot.param.grad is not None:
+            if not slot.submitted and slot.small is None and slot.param.grad is not None:
                 self._submit(slot, slot.param.grad)
+        self._flush_small(release=False)
         self.step_sync()
         return loss
 
@@ -268,13 +298,15 @@ class AdamX(torch.optim.Optimizer):
 
     @property
     def backend(self) -> str:
-        """``'native/<isa>'`` or ``'torch'`` (FP8 moments always use the PyTorch kernel)."""
+        """``'native/<isa>'`` (every moment precision, FP8 included) or ``'torch'``."""
         k = self._engine.native
         return f"native/{k.simd_level}" if k is not None else "torch"
 
     def memory_report(self) -> dict[str, int]:
         """Host bytes held by the optimizer, by category."""
         report = {"master": 0, "moments": 0, "staging": 0}
+        for group in self._small_groups:
+            report["staging"] += sum(buf.nbytes for buf in group._grad_host.values())
         for slot in self._ordered:
             if not slot.initialized:
                 continue
@@ -326,8 +358,8 @@ class AdamX(torch.optim.Optimizer):
             slot.step = int(st["step"])
             if st.get("master") is not None:
                 slot.master.copy_(st["master"].reshape(-1))
-            slot.m = self._load_store(st["exp_avg"], slot.numel, "m")
-            slot.v = self._load_store(st["exp_avg_sq"], slot.numel, "v")
+            self._engine.replace_moments(slot, self._load_store(st["exp_avg"], slot.numel, "m"),
+                                         self._load_store(st["exp_avg_sq"], slot.numel, "v"))
 
     def _load_store(self, saved, numel: int, role: str):
         if isinstance(saved, torch.Tensor):  # torch.optim.AdamW layout

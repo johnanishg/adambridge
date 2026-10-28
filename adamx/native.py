@@ -37,16 +37,17 @@ from pathlib import Path
 
 import torch
 
-__all__ = ["NativeKernels", "load", "build", "available", "SIMD_NAMES", "BuildError"]
+__all__ = ["NativeKernels", "Group", "Segment", "load", "build", "available", "SIMD_NAMES", "BuildError"]
 
 log = logging.getLogger("adamx.native")
 
-ABI_VERSION = 1
+ABI_VERSION = 3
 SOURCE = Path(__file__).with_name("csrc") / "adamx_kernels.c"
 SIMD_NAMES = {0: "scalar", 1: "avx2", 2: "avx512", 3: "neon"}
 
-DT_NONE, DT_F32, DT_BF16 = 0, 1, 2
+DT_NONE, DT_F32, DT_BF16, DT_FP8 = 0, 1, 2, 3
 _DTYPE_CODES = {torch.float32: DT_F32, torch.bfloat16: DT_BF16}
+MOMENT_CODES = {"fp32": DT_F32, "bf16": DT_BF16, "fp8": DT_FP8}
 
 
 class BuildError(RuntimeError):
@@ -65,6 +66,44 @@ class _HParams(ctypes.Structure):
         ("eps", ctypes.c_float),
         ("seed", ctypes.c_uint32),
         ("stochastic", ctypes.c_int32),
+    ]
+
+
+class Group(ctypes.Structure):
+    """Hyperparameters shared by the segments of one parameter group (adamx_group)."""
+
+    _fields_ = [
+        ("lr", ctypes.c_double),
+        ("beta1", ctypes.c_double),
+        ("beta2", ctypes.c_double),
+        ("eps", ctypes.c_double),
+        ("weight_decay", ctypes.c_double),
+        ("seed", ctypes.c_uint64),
+        ("stochastic", ctypes.c_int32),
+        ("reserved", ctypes.c_int32),
+    ]
+
+
+class Segment(ctypes.Structure):
+    """One tensor's host buffers (adamx_segment). Pointers are raw addresses."""
+
+    _fields_ = [
+        ("p", ctypes.c_void_p),
+        ("g", ctypes.c_void_p),
+        ("m", ctypes.c_void_p),
+        ("v", ctypes.c_void_p),
+        ("m_scale", ctypes.c_void_p),
+        ("v_scale", ctypes.c_void_p),
+        ("out", ctypes.c_void_p),
+        ("group", ctypes.POINTER(Group)),
+        ("n", ctypes.c_int64),
+        ("step", ctypes.c_int64),
+        ("index", ctypes.c_uint64),
+        ("offset", ctypes.c_int64),
+        ("g_dtype", ctypes.c_int32),
+        ("mv_dtype", ctypes.c_int32),
+        ("out_dtype", ctypes.c_int32),
+        ("reserved", ctypes.c_int32),
     ]
 
 
@@ -115,7 +154,7 @@ def _compile_cmd(kind: str, prefix: list[str], out: Path) -> list[str]:
         return [*prefix, "/nologo", "/O2", "/LD", str(SOURCE), f"/Fe:{out}"]
     cmd = [*prefix, "-O3", "-std=c11", "-shared", "-fvisibility=hidden", str(SOURCE), "-o", str(out)]
     if sys.platform != "win32":
-        cmd.insert(-3, "-fPIC")
+        cmd[-3:-3] = ["-fPIC", "-pthread"]
     if sys.platform.startswith("linux"):
         cmd.append("-lm")
     return cmd
@@ -188,8 +227,9 @@ class NativeKernels:
         lib.adamx_abi_version.restype = ctypes.c_int
         if lib.adamx_abi_version() != ABI_VERSION:
             raise BuildError(f"{path} has ABI {lib.adamx_abi_version()}, expected {ABI_VERSION}")
-        if lib.adamx_hparams_size() != ctypes.sizeof(_HParams):
-            raise BuildError("adamx_hparams layout mismatch between C and Python")
+        for fn, struct in (("adamx_hparams_size", _HParams), ("adamx_group_size", Group), ("adamx_segment_size", Segment)):
+            if getattr(lib, fn)() != ctypes.sizeof(struct):
+                raise BuildError(f"{fn}: struct layout mismatch between C and Python")
         for fn in ("adamx_simd_level", "adamx_detected_simd_level", "adamx_set_simd_level"):
             getattr(lib, fn).restype = ctypes.c_int
         lib.adamx_set_simd_level.argtypes = [ctypes.c_int]
@@ -200,6 +240,19 @@ class NativeKernels:
             ctypes.c_void_p, ctypes.c_int,
             ctypes.c_int64, ctypes.c_uint64, ctypes.POINTER(_HParams),
         ]
+        lib.adamx_pool_create.restype = ctypes.c_void_p
+        lib.adamx_pool_create.argtypes = [ctypes.c_int32, ctypes.POINTER(ctypes.c_int32), ctypes.c_int32]
+        lib.adamx_pool_destroy.restype = None
+        lib.adamx_pool_destroy.argtypes = [ctypes.c_void_p]
+        lib.adamx_pool_threads.restype = ctypes.c_int32
+        lib.adamx_pool_threads.argtypes = [ctypes.c_void_p]
+        lib.adamx_pool_set_spin.restype = None
+        lib.adamx_pool_set_spin.argtypes = [ctypes.c_void_p, ctypes.c_int32]
+        seg_array = ctypes.POINTER(ctypes.POINTER(Segment))
+        lib.adamx_multi_step.restype = ctypes.c_int
+        lib.adamx_multi_step.argtypes = [ctypes.c_void_p, seg_array, ctypes.c_int32, ctypes.c_int32]
+        lib.adamx_multi_apply.restype = ctypes.c_int
+        lib.adamx_multi_apply.argtypes = [ctypes.c_void_p, seg_array, ctypes.POINTER(_HParams), ctypes.c_int32, ctypes.c_int32]
         self._lib = lib
 
     @property
@@ -219,9 +272,52 @@ class NativeKernels:
     def supports(grad_dtype: torch.dtype, moment_precision: str, out_dtype: torch.dtype | None) -> bool:
         return (
             grad_dtype in _DTYPE_CODES
-            and moment_precision in ("fp32", "bf16")
+            and moment_precision in MOMENT_CODES
             and (out_dtype is None or out_dtype in _DTYPE_CODES)
         )
+
+    @staticmethod
+    def dtype_code(dtype: torch.dtype | None) -> int:
+        return DT_NONE if dtype is None else _DTYPE_CODES[dtype]
+
+    # -- thread pool -------------------------------------------------------
+
+    def create_pool(self, threads: int, cpus: tuple[int, ...] | None = None) -> int:
+        """Native pool of ``threads`` threads (the calling thread counts as one)."""
+        arr = (ctypes.c_int32 * len(cpus))(*cpus) if cpus else None
+        handle = self._lib.adamx_pool_create(threads, arr, len(cpus) if cpus else 0)
+        if not handle:
+            raise RuntimeError("adamx_pool_create failed")
+        spin = os.environ.get("ADAMX_SPIN")
+        if spin:
+            self._lib.adamx_pool_set_spin(handle, int(spin))
+        return handle
+
+    def destroy_pool(self, handle: int) -> None:
+        self._lib.adamx_pool_destroy(handle)
+
+    def pool_threads(self, handle: int) -> int:
+        return self._lib.adamx_pool_threads(handle)
+
+    # -- batched updates ---------------------------------------------------
+
+    @staticmethod
+    def segment_array(segments: list) -> ctypes.Array:
+        """Array of pointers for multi_step/multi_apply; ``segments`` holds Segment pointers."""
+        return (ctypes.POINTER(Segment) * len(segments))(*segments)
+
+    def multi_step(self, pool: int | None, segments: ctypes.Array, threads: int) -> None:
+        """Update every segment; coefficients come from each segment's group and step."""
+        rc = self._lib.adamx_multi_step(pool, segments, len(segments), threads)
+        if rc != 0:
+            raise RuntimeError(f"adamx_multi_step rejected a segment (code {rc})")
+
+    def multi_apply(self, pool: int | None, segments: ctypes.Array, hparams: list, threads: int) -> None:
+        """Like multi_step with explicit coefficients, one ``_HParams`` per segment."""
+        hps = (_HParams * len(hparams))(*hparams)
+        rc = self._lib.adamx_multi_apply(pool, segments, hps, len(segments), threads)
+        if rc != 0:
+            raise RuntimeError(f"adamx_multi_apply rejected a segment (code {rc})")
 
     @staticmethod
     def make_hparams(c: StepCoefficients, seed: int, stochastic: bool) -> _HParams:
