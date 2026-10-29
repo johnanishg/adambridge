@@ -1,6 +1,6 @@
-# adambridge v0.1.0
+# adambridge v0.1.2
 
-First public release of **adambridge**: AdamW for PyTorch with the optimizer state offloaded
+First release published on PyPI of **adambridge**: AdamW for PyTorch with the optimizer state offloaded
 to host RAM and updated by fused SIMD kernels on the CPU, overlapped with the GPU backward
 pass, layer by layer. It implements the *OptiCompute-Bridge* design: the GPU keeps only the
 parameters, while FP32 master weights and both Adam moments live on the (NUMA-local) host.
@@ -24,6 +24,29 @@ for x, y in loader:
 
 Without `attach_hooks`, `AdamBridge` is a drop-in optimizer (`backward(); step(); zero_grad()`),
 and works with LR schedulers and `clip_grad_norm_`. `adambridge.OptiComputeAdamW` is an alias.
+
+## What's new in 0.1.2
+
+0.1.2 is the first version on PyPI. Compared with the `v0.1.0` tag, the optimizer's algorithm,
+kernels and numerics are unchanged; the changes are naming, licensing and packaging.
+
+* **Renamed from `adamx` to `adambridge`.** Update your code accordingly:
+
+  | v0.1.0 | v0.1.2 |
+  |---|---|
+  | `pip install adamx` / `import adamx` | `pip install adambridge` / `import adambridge` |
+  | `adamx.AdamX(...)` | `adambridge.AdamBridge(...)` (`OptiComputeAdamW` is still an alias) |
+  | `python -m adamx build` / `info` | `python -m adambridge build` / `info` |
+  | `ADAMX_CACHE_DIR`, `ADAMX_CC`, `ADAMX_DISABLE_NATIVE`, `ADAMX_SPIN` | `ADAMBRIDGE_CACHE_DIR`, `ADAMBRIDGE_CC`, `ADAMBRIDGE_DISABLE_NATIVE`, `ADAMBRIDGE_SPIN` |
+  | kernel cache in `~/.cache/adamx` | `~/.cache/adambridge` (the kernel is recompiled once on first use) |
+
+  Checkpoints saved by v0.1.0 still load with `load_state_dict()`.
+* **Licensed under Apache-2.0**, with the `LICENSE` file shipped in the sdist and wheel.
+* **Published to PyPI** by a GitHub Actions workflow using trusted publishing (no API
+  tokens). Each release checks that its tag matches the package version.
+* **Continuous integration** on every push and pull request: lint, the native C self-test
+  built with gcc, and the test suite on Python 3.10, 3.11 and 3.12 (CPU; the CUDA tests
+  run locally on a GPU machine).
 
 ## Highlights
 
@@ -69,7 +92,7 @@ and works with LR schedulers and `clip_grad_norm_`. `adambridge.OptiComputeAdamW
 All numbers come from two `adambridge-lab` reports generated on 2026-10-28. Test machine: a
 laptop with an NVIDIA GeForce RTX 5090 Laptop GPU (24 GiB VRAM), Intel Core Ultra 9 290HX Plus
 (24 threads, AVX2), 64 GiB RAM, Windows 11, Python 3.14.7, PyTorch 2.14.1 + CUDA 13.2,
-adambridge 0.1.0 (native/avx2 backend). Compared libraries: bitsandbytes 0.50.2, torchao
+native/avx2 backend. They were measured with the v0.1.0 code, which 0.1.2 only renames. Compared libraries: bitsandbytes 0.50.2, torchao
 0.18.0; DeepSpeed 0.19.8 (CPU kernel only, under WSL, because it is not installed on Windows).
 
 ### Fine-tuning a real LLM
@@ -440,8 +463,9 @@ What the tests check:
   atol 1e-7), in sync and async modes.
 * Parameter groups, schedulers, weight tying, gradient accumulation, gradient clipping, BF16
   params, checkpoint resume, chunked updates, exact-size pinned buffers, and the auto-tuner.
-* The C self-test compares the SIMD paths against scalar code and checks the FP8 codec and
-  thread-count and chunking invariance.
+* The C self-test compares the SIMD paths against scalar code and checks the FP8 codec,
+  thread-count and chunking invariance, and thread pools used immediately after creation.
+  It passes under AddressSanitizer, UndefinedBehaviorSanitizer and ThreadSanitizer.
 
 ## Known limitations
 

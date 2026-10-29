@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "adambridge"
-version = "0.1.0"
+version = "0.1.2"
 description = "AdamW with host-offloaded state, fused SIMD CPU kernels, and layer-wise overlap with the GPU backward pass"
 readme = "README.md"
 license = "Apache-2.0"

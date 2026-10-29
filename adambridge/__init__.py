@@ -7,7 +7,7 @@ from .engine import StepStats
 from .optimizer import AdamBridge, OptiComputeAdamW
 from .precision import bytes_per_param
 
-__version__ = "0.1.0"
+__version__ = "0.1.2"
 
 __all__ = [
     "AdamBridge",
