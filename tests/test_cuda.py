@@ -126,6 +126,130 @@ def test_exact_size_pinned_buffers(monkeypatch):
     assert not opt._engine._pinned._registered
 
 
+def _stale_reference(model, steps, make_opt, warmup):
+    """Per-step losses and final weights of an optimizer whose updates reach
+    the model one step late after ``warmup`` exact steps: forward pass k uses
+    the weights after k - 1 updates up to step warmup + 1, after k - 2 updates
+    from then on."""
+    master = copy.deepcopy(model).float()
+    ref = make_opt(master.parameters())
+    snapshots = [[p.detach().clone() for p in master.parameters()]]  # snapshots[j] = after j updates
+    losses = []
+    for k in range(1, steps + 1):
+        lag = k - 1 if k <= warmup + 1 else k - 2
+        with torch.no_grad():
+            for p, w in zip(model.parameters(), snapshots[lag]):
+                p.copy_(w)
+        model.zero_grad()
+        loss = lm_loss(model, k)
+        loss.backward()
+        losses.append(loss.item())
+        for p, q in zip(master.parameters(), model.parameters()):
+            p.grad = q.grad.float()
+        ref.step()
+        snapshots.append([p.detach().clone() for p in master.parameters()])
+    return losses, snapshots[-1]
+
+
+@pytest.mark.parametrize("warmup", [0, 3])
+@pytest.mark.parametrize("precision", ["fp32", "bf16"])
+def test_delayed_updates_match_one_step_stale_adamw(monkeypatch, warmup, precision):
+    """Same losses at every step and the same final weights (after flush) as
+    AdamW whose updates reach the model one step late; chunked transfers and
+    grouped small parameters included."""
+    monkeypatch.setattr(engine, "_CHUNK", 4096)  # the embedding (97 x 64) moves in 2 chunks
+    torch.manual_seed(0)
+    model = TinyLM().cuda()
+    want_losses, want = _stale_reference(copy.deepcopy(model), 10, lambda ps: torch.optim.AdamW(ps, lr=3e-3), warmup)
+    opt = adambridge.AdamBridge(model.parameters(), lr=3e-3, precision=precision, delay_updates=True,
+                                delay_warmup_steps=warmup, small_param_threshold=2000).attach_hooks(model)
+    assert any(s.small is not None for s in opt._ordered) and any(s.small is None for s in opt._ordered)
+    losses = []
+    for k in range(1, 11):
+        loss = lm_loss(model, k)
+        loss.backward()
+        opt.step_sync()
+        losses.append(loss.item())
+    opt.flush()
+    tol = 1e-4 if precision == "fp32" else 2e-2
+    assert max(abs(a - b) for a, b in zip(losses, want_losses)) < tol
+    assert max((p - w).abs().max().item() for p, w in zip(model.parameters(), want)) < (1e-5 if precision == "fp32" else 1e-2)
+    opt.close()
+
+
+def test_delayed_updates_state_dict_close_and_unused_params():
+    """state_dict() and close() apply pending updates; a parameter without a
+    gradient in one step still gets its earlier update within one step."""
+    torch.manual_seed(0)
+    model = TinyLM().cuda()
+    opt = adambridge.AdamBridge(model.parameters(), lr=1e-2, delay_updates=True, small_param_threshold=0).attach_hooks(model)
+    head = model.blocks[-1][3].weight
+    for k in range(3):
+        lm_loss(model, k).backward()
+        opt.step_sync()
+    before = head.detach().clone()
+    head.requires_grad_(False)          # gets no gradient in the next step
+    lm_loss(model, 3).backward()
+    opt.step_sync()                     # its pending update is written back here
+    torch.cuda.synchronize()
+    assert not torch.equal(head, before)
+    assert torch.equal(head.detach().reshape(-1).float().cpu(), opt._slots[head].master.to_fp32())
+    head.requires_grad_(True)
+    lm_loss(model, 4).backward()
+    opt.step_sync()
+    opt.state_dict()
+    torch.cuda.synchronize()
+    for p, master in zip(model.parameters(), opt.master_params()):
+        assert torch.equal(p.detach().reshape(-1).cpu(), master)
+    lm_loss(model, 5).backward()
+    opt.step_sync()
+    opt.close()
+    torch.cuda.synchronize()
+    for p, master in zip(model.parameters(), opt.master_params()):
+        assert torch.equal(p.detach().reshape(-1).cpu(), master)
+
+
+@pytest.mark.parametrize("delay", [False, True])
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_lion_hooks_on_cuda_match_reference(backend, delay):
+    from test_lion import RefLion
+    torch.manual_seed(0)
+    model = TinyLM().cuda()
+    want_losses, want = _stale_reference(copy.deepcopy(model), 6, lambda ps: RefLion(ps, lr=1e-3, weight_decay=0.1),
+                                         warmup=10**9 if not delay else 0)
+    opt = adambridge.LionBridge(model.parameters(), lr=1e-3, weight_decay=0.1, backend=backend,
+                                delay_updates=delay).attach_hooks(model)
+    losses = []
+    for k in range(1, 7):
+        loss = lm_loss(model, k)
+        loss.backward()
+        opt.step_sync()
+        losses.append(loss.item())
+    opt.flush()
+    assert max(abs(a - b) for a, b in zip(losses, want_losses)) < 1e-5
+    assert max((p - w).abs().max().item() for p, w in zip(model.parameters(), want)) < 1e-6
+    assert all(s.v is None for s in opt._ordered)
+    opt.close()
+
+
+def test_accumulation_steps_on_cuda():
+    torch.manual_seed(0)
+    ref_model = TinyLM().cuda()
+    model = copy.deepcopy(ref_model)
+    ref = torch.optim.AdamW(ref_model.parameters(), lr=3e-3)
+    opt = adambridge.AdamBridge(model.parameters(), lr=3e-3, accumulation_steps=2).attach_hooks(model)
+    for step in range(4):
+        ref.zero_grad()
+        for micro in range(2):
+            (lm_loss(ref_model, 10 * step + micro) / 2).backward()
+        ref.step()
+        for micro in range(2):
+            (lm_loss(model, 10 * step + micro) / 2).backward()
+        opt.step_sync()
+    assert max_param_diff(ref_model, model) < 1e-5
+    opt.close()
+
+
 def test_small_parameter_without_grad_is_not_updated():
     """A grouped parameter that gets no gradient keeps its value, like torch.optim.AdamW."""
     torch.manual_seed(0)

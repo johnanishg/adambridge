@@ -1,9 +1,10 @@
-"""Host AdamW step throughput: adambridge kernels vs torch.optim.AdamW on CPU.
+"""Host AdamW (and Lion) step throughput: adambridge kernels vs torch.optim.AdamW on CPU.
 
     python benchmarks/bench_kernels.py --numel 64M --threads 8
 
 Reports wall time per step and effective DRAM bandwidth (bytes each
-implementation must move at minimum: read p,g,m,v; write p,m,v[,out]).
+implementation must move at minimum: read p,g,m,v; write p,m,v[,out]; Lion
+has no v).
 """
 
 from __future__ import annotations
@@ -43,23 +44,25 @@ def bench_torch_adamw(n, repeats, **kw):
     return timeit(opt.step, repeats)
 
 
-def bench_adambridge(n, repeats, precision, backend, threads, grad_dtype, out_dtype):
-    eng = UpdateEngine(precision=precision, backend=backend, numa_aware=False, num_threads=threads)
+def bench_adambridge(n, repeats, precision, backend, threads, grad_dtype, out_dtype, algorithm="adamw"):
+    lion = algorithm == "lion"
+    eng = UpdateEngine(precision=precision, backend=backend, numa_aware=False, num_threads=threads, algorithm=algorithm)
     try:
         pool = eng.ensure_pool(torch.device("cpu"))
         master = torch.randn(n)
         grad = (torch.randn(n) * 1e-3).to(grad_dtype)
-        m, v = make_store(precision, n, "m"), make_store(precision, n, "v")
+        m, v = make_store(precision, n, "m"), None if lion else make_store(precision, n, "v")
         out = None if out_dtype is None else torch.empty(n, dtype=out_dtype)
-        c = StepCoefficients.for_step(1e-4, 0.9, 0.999, 1e-8, 0.01, 10)
+        c = (StepCoefficients.for_lion(1e-5, 0.9, 0.99, 0.01) if lion
+             else StepCoefficients.for_step(1e-4, 0.9, 0.999, 1e-8, 0.01, 10))
         return timeit(lambda: eng.run_kernel(master, grad, m, v, out, c, 0, pool), repeats)
     finally:
         eng.close()
 
 
-def min_bytes(precision, grad_bytes, out_bytes):
+def min_bytes(precision, grad_bytes, out_bytes, moments=2):
     mv = {"fp32": 4, "bf16": 2, "fp8": 1 + 4 / 128}[precision]
-    return 4 * 2 + grad_bytes + mv * 4 + out_bytes  # p r/w, g r, m+v r/w, out w
+    return 4 * 2 + grad_bytes + mv * 2 * moments + out_bytes  # p r/w, g r, moments r/w, out w
 
 
 def main():
@@ -90,11 +93,13 @@ def main():
         ("bf16", torch.bfloat16, torch.bfloat16),
         ("fp8", torch.bfloat16, torch.bfloat16),
     ]
-    for backend in (["native"] if kernels else []) + ["torch"]:
-        for precision, gdt, odt in configs:
-            label = f"adambridge {backend:<6} moments={precision:<4} grad={str(gdt)[6:]:<8} out={str(odt)[6:] if odt else '-'}"
-            t = bench_adambridge(n, args.repeats, precision, backend, threads, gdt, odt)
-            row(label, t, min_bytes(precision, 2 if gdt == torch.bfloat16 else 4, 2 if odt else 0))
+    for algorithm, name in (("adamw", "adambridge"), ("lion", "lionbridge")):
+        for backend in (["native"] if kernels else []) + ["torch"]:
+            for precision, gdt, odt in configs:
+                label = f"{name} {backend:<6} moments={precision:<4} grad={str(gdt)[6:]:<8} out={str(odt)[6:] if odt else '-'}"
+                t = bench_adambridge(n, args.repeats, precision, backend, threads, gdt, odt, algorithm)
+                row(label, t, min_bytes(precision, 2 if gdt == torch.bfloat16 else 4, 2 if odt else 0,
+                                        1 if algorithm == "lion" else 2))
 
 
 if __name__ == "__main__":

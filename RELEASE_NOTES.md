@@ -1,6 +1,6 @@
-# adambridge v0.1.2
+# adambridge v0.2.0
 
-First release published on PyPI of **adambridge**: AdamW for PyTorch with the optimizer state offloaded
+**adambridge**: AdamW for PyTorch with the optimizer state offloaded
 to host RAM and updated by fused SIMD kernels on the CPU, overlapped with the GPU backward
 pass, layer by layer. It implements the *OptiCompute-Bridge* design: the GPU keeps only the
 parameters, while FP32 master weights and both Adam moments live on the (NUMA-local) host.
@@ -24,6 +24,61 @@ for x, y in loader:
 
 Without `attach_hooks`, `AdamBridge` is a drop-in optimizer (`backward(); step(); zero_grad()`),
 and works with LR schedulers and `clip_grad_norm_`. `adambridge.OptiComputeAdamW` is an alias.
+
+## What's new in 0.2.0
+
+The headline: **Qwen2.5-7B fine-tunes on a 24 GB laptop GPU** (RTX 5090 Laptop, 43 GiB of host memory under
+WSL 2) at 1,122 tokens/s, 18.2 GiB GPU and 38.0 GiB host. No other library tested fits it, and neither did 0.1.2.
+Measured by the `adambridge-lab` arena against DeepSpeed 0.19.9 (ZeRO-Offload, ZeRO-Infinity, ZenFlow,
+SuperOffload), torchao 0.18.0, bitsandbytes 0.50.2 and all-GPU PyTorch; the README has the tables.
+
+| | 0.2.0 result (lab report 2026-11-12 17:22) |
+|---|---|
+| Largest model trained here | 8.02B parameters, vs 2.08B for the next library |
+| Qwen2.5-0.5B / 1.5B vs DeepSpeed's best | +113% / +120% tokens/s at the same quality |
+| Qwen2.5-3B | only adambridge trains it |
+| vs all-GPU AdamW when the model fits | a tie (`gpu_state_budget="auto"`, or `delay_updates=True`) |
+
+New:
+
+* **`master_precision="fp24"`**: the master weights kept as the top 24 bits of their FP32 value (sign, 8 exponent
+  bits, 15 mantissa bits; relative precision 2^-16) in two planes, 3 bytes per parameter instead of 4, rounded
+  stochastically by the fused kernels (AVX2, AVX-512, NEON and scalar paths, AdamW and Lion, every moment
+  format). With FP8 moments the host state is ~5.06 bytes per parameter. The low-precision copy for the GPU is
+  always the value actually stored. Checkpoints save the planes and load into either master precision. It ties
+  the reference at 0.5B, 1.5B and 3B (Δ final validation loss +0.0002, +0.0002, −0.0002), at the speed of the
+  FP32 master, with 9–15% less host memory.
+* **`adambridge.causal_lm_loss`**: the next-token cross-entropy computed a slice of positions at a time and
+  recomputed in the backward pass, so a 150k-token vocabulary never materialises its full logits tensor
+  (2.3 GiB in FP32 for 8 × 512 tokens, held twice). Same value and gradients as the Hugging Face loss.
+* **Delayed updates** (`delay_updates=True`, `delay_warmup_steps`, `flush()`): each update is applied one step
+  late, so the CPU update overlaps the whole next forward and backward pass. Matches AdamW applied one step late
+  exactly; staleness can cost quality, so measure it on your task (see the README).
+* **`LionBridge`**: the Lion optimizer on the same pipeline, one moment instead of two (8 host bytes per
+  parameter with FP32 state), bit-identical across SIMD paths.
+* **`gpu_state_budget`** (`None`, `"auto"` or bytes): keeps the optimizer state of the parameters that receive
+  their gradients last on the GPU, where the host update could not overlap anything. With `"auto"` it ties
+  all-GPU training when the model fits and falls back to offloading when it does not.
+* **Transfer ring** (`transfer_buffer_mb`): large models share one pinned 512 MB ring instead of per-parameter
+  pinned buffers (about 30 GB less host RAM for a 7B model), bit-identical results.
+* **`accumulation_steps`**: gradient accumulation without `no_sync()`, for training loops you don't control
+  (the Hugging Face `Trainer`, tested).
+* **torch.compile** in every mode: per block, whole model (including CUDA graphs) and compiled autograd.
+* Faster native updates of small tensors (thread count capped by tensor size).
+* Hardening: compilers are not taken from the current directory, a cached kernel library writable by other
+  users is refused, checkpoints are validated before anything is loaded (sizes, dtypes, parameter indices),
+  and the C kernel's bounds and layouts are checked in front of it.
+
+Upgrading from 0.1.2: no API is removed or changed, and 0.1.2 checkpoints load. The native kernel's interface
+changed (ABI 5), so it is recompiled once on first use.
+
+Verified: 195 tests pass on Linux with CUDA, 186 on Windows; the C self-test passes under ASan + UBSan and TSan,
+and as an ARM (NEON) build under QEMU emulation. The AVX-512 path has still never been executed (see *Known
+limitations* in the README).
+
+---
+
+# Earlier releases
 
 ## What's new in 0.1.2
 

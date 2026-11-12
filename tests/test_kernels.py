@@ -3,8 +3,8 @@ import torch
 
 from adambridge import native
 from adambridge.engine import UpdateEngine
-from adambridge.kernels import StepCoefficients, fused_adamw_chunk, split_range
-from adambridge.precision import make_store
+from adambridge.kernels import StepCoefficients, fused_adamw_chunk, fused_lion_chunk, split_range
+from adambridge.precision import make_master, make_store
 
 from conftest import NATIVE
 
@@ -131,8 +131,9 @@ def test_native_fp8_matches_torch_fp8(stochastic, out_dtype):
 
 
 @pytest.mark.parametrize("backend", ["torch"] + (["native"] if NATIVE else []))
+@pytest.mark.parametrize("master_prec", ["fp32", "fp24"])
 @pytest.mark.parametrize("prec", ["fp32", "bf16", "fp8"])
-def test_results_independent_of_thread_count(backend, prec):
+def test_results_independent_of_thread_count(backend, prec, master_prec):
     """Including stochastic rounding: RNG streams are keyed by element/chunk, not thread."""
     c = StepCoefficients.for_step(1e-3, 0.9, 0.999, 1e-8, 0.01, 2)
     results = []
@@ -141,10 +142,67 @@ def test_results_independent_of_thread_count(backend, prec):
         try:
             pool = eng.ensure_pool(torch.device("cpu"))
             master, grad, m, v, out = make_inputs(prec, torch.bfloat16, torch.bfloat16)
+            if master_prec == "fp24":
+                master = make_master("fp24", N, init=master)
             eng.run_kernel(master, grad, m, v, out, c, 99, pool)
-            results.append((master, m.to_fp32(), v.to_fp32(), out))
+            results.append((master if isinstance(master, torch.Tensor) else master.to_fp32(),
+                            m.to_fp32(), v.to_fp32(), out))
         finally:
             eng.close()
     for other in results[1:]:
         for x, y in zip(results[0], other):
             assert torch.equal(x, y)
+
+
+def _fp24_inputs(prec, lion=False):
+    master, grad, m, v, out = make_inputs(prec, torch.bfloat16, torch.bfloat16)
+    return make_master("fp24", N, init=master), grad, m, None if lion else v, out
+
+
+@pytest.mark.parametrize("lion", [False, True])
+def test_torch_kernel_fp24_master_tracks_fp32_and_writes_the_stored_value(lion):
+    """The PyTorch kernel with an FP24 master: within one 24-bit ulp of the FP32 result, and ``out`` is the
+    stored (rounded) master cast to BF16."""
+    c = (StepCoefficients.for_lion(1e-3, 0.9, 0.99, 0.01) if lion
+         else StepCoefficients.for_step(1e-3, 0.9, 0.999, 1e-8, 0.01, 3))
+    f32 = make_inputs("bf16", torch.bfloat16, torch.bfloat16)
+    f24 = _fp24_inputs("bf16", lion)
+    for seed in (None, 4321):
+        if lion:
+            fused_lion_chunk(f32[0], f32[1], f32[2], f32[4], c, 0, N, seed=seed)
+            fused_lion_chunk(f24[0], f24[1], f24[2], f24[4], c, 0, N, seed=seed)
+        else:
+            fused_adamw_chunk(*f32, c, 0, N, seed=seed)
+            fused_adamw_chunk(*f24, c, 0, N, seed=seed)
+        stored = f24[0].to_fp32()
+        assert ((stored - f32[0]).abs() <= f32[0].abs() * 2**-13).all()
+        assert torch.equal(f24[4], stored.to(torch.bfloat16))
+
+
+@needs_native
+@pytest.mark.parametrize("stochastic", [False, True])
+@pytest.mark.parametrize("prec", ["fp32", "fp8"])
+@pytest.mark.parametrize("lion", [False, True])
+def test_native_fp24_master_matches_torch(stochastic, prec, lion):
+    """Native and PyTorch kernels with an FP24 master: the same stored bits (bar FMA boundary cases), and the
+    accelerator copy is always the stored value rounded."""
+    c = (StepCoefficients.for_lion(1e-3, 0.9, 0.99, 0.01) if lion
+         else StepCoefficients.for_step(1e-3, 0.9, 0.999, 1e-8, 0.01, 3))
+    results = []
+    for backend in ("native", "torch"):
+        eng = UpdateEngine(precision=prec, backend=backend, numa_aware=False, stochastic_rounding=stochastic,
+                           algorithm="lion" if lion else "adamw")
+        try:
+            pool = eng.ensure_pool(torch.device("cpu"))
+            master, grad, m, v, out = _fp24_inputs(prec, lion)
+            for _ in range(3):
+                eng.run_kernel(master, grad, m, v, out, c, 1234, pool)
+            results.append((master, out))
+        finally:
+            eng.close()
+    (sa, oa), (sb, ob) = results
+    pa, pb = sa.to_fp32(), sb.to_fp32()
+    torch.testing.assert_close(pa, pb, rtol=2**-12, atol=1e-6)
+    same = ((sa.hi == sb.hi) & (sa.lo == sb.lo)).float().mean().item()
+    assert same > 0.99
+    assert torch.equal(oa, pa.to(torch.bfloat16)) and torch.equal(ob, pb.to(torch.bfloat16))

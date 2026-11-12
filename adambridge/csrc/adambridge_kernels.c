@@ -20,6 +20,16 @@
  * scale per 128-element block). adambridge_multi_step updates many tensors in one
  * call on a persistent native thread pool, so per-tensor cost from Python is
  * a pointer in an array rather than a thread hand-off.
+ *
+ * The master weights are FP32, or "FP24": the top 24 bits of the FP32 value
+ * (sign, 8 exponent bits, 15 mantissa bits) in two planes, hi (uint16: exactly
+ * the BF16 bits) and lo (uint8: the next 8 bits). 3 bytes per parameter instead
+ * of 4, relative precision 2^-16; stores round stochastically (nearest-even when
+ * stochastic rounding is off) from their own random stream. The low-precision
+ * copy for the accelerator is always taken from the value actually stored.
+ *
+ * A segment can instead select Lion (one moment, sign update; see the Lion
+ * section below), with the same storage formats, threading and chunking.
  */
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #  define _GNU_SOURCE 1  /* pthread_setaffinity_np */
@@ -58,10 +68,11 @@
 #  include <arm_neon.h>
 #endif
 
-#define ADAMBRIDGE_ABI_VERSION 3
+#define ADAMBRIDGE_ABI_VERSION 5
 
-enum { DT_NONE = 0, DT_F32 = 1, DT_BF16 = 2, DT_FP8 = 3 };
+enum { DT_NONE = 0, DT_F32 = 1, DT_BF16 = 2, DT_FP8 = 3, DT_F24 = 4 };
 enum { SIMD_SCALAR = 0, SIMD_AVX2 = 1, SIMD_AVX512 = 2, SIMD_NEON = 3 };
+enum { ALGO_ADAMW = 0, ALGO_LION = 1 };
 
 typedef struct adambridge_hparams {
     float beta1;
@@ -69,7 +80,7 @@ typedef struct adambridge_hparams {
     float one_minus_beta1;
     float one_minus_beta2;
     float decay;         /* 1 - lr * weight_decay */
-    float step_size;     /* lr / (1 - beta1^t) */
+    float step_size;     /* AdamW: lr / (1 - beta1^t); Lion: lr */
     float inv_sqrt_bc2;  /* 1 / sqrt(1 - beta2^t) */
     float eps;
     uint32_t seed;       /* stochastic rounding stream for this (param, step) */
@@ -118,23 +129,56 @@ static inline size_t dt_size(int dt) { return dt == DT_F32 ? 4 : (dt == DT_BF16 
 static inline void* adv(void* p, int dt, int64_t i) { return p ? (char*)p + (size_t)i * dt_size(dt) : p; }
 static inline const void* cadv(const void* p, int dt, int64_t i) { return (const char*)p + (size_t)i * dt_size(dt); }
 
-static uint32_t seed_v_of(uint32_t seed) { return hash32(seed ^ 0xA511E9B3U); }
+/* Master weights: p points at FP32 values (pt == DT_F32) or at the FP24 hi
+ * plane (uint16) with plo the lo plane (pt == DT_F24); see the header comment. */
+static inline float load_master(const void* p, const uint8_t* plo, int pt, int64_t i)
+{
+    if (pt == DT_F24) return bits_f32(((uint32_t)((const uint16_t*)p)[i] << 16) | ((uint32_t)plo[i] << 8));
+    return ((const float*)p)[i];
+}
 
-static void fused_scalar(float* p, const void* g, int gt, void* m, void* v, int mvt,
+/* Round FP32 bits to the top 24: stochastically with r, else to nearest even. */
+static inline uint32_t f24_round_bits(uint32_t b, int sr, uint32_t r)
+{
+    if ((b & 0x7fffffffU) > 0x7f800000U) return b | 0x00400000U;  /* quiet NaN */
+    b = sr ? b + (r & 0xffU) : b + 0x7fU + ((b >> 8) & 1U);
+    return b & ~0xffU;
+}
+
+/* Store x as element i of the master; returns the value actually stored. */
+static inline float store_master(void* p, uint8_t* plo, int pt, int64_t i, float x, int sr, uint32_t r)
+{
+    if (pt == DT_F24) {
+        const uint32_t b = f24_round_bits(f32_bits(x), sr, r);
+        ((uint16_t*)p)[i] = (uint16_t)(b >> 16);
+        plo[i] = (uint8_t)(b >> 8);
+        return bits_f32(b);
+    }
+    ((float*)p)[i] = x;
+    return x;
+}
+
+static inline void* padv(void* p, int pt, int64_t i) { return (char*)p + (size_t)i * (pt == DT_F24 ? 2 : 4); }
+static inline uint8_t* ladv(uint8_t* plo, int64_t i) { return plo ? plo + i : plo; }
+
+static uint32_t seed_v_of(uint32_t seed) { return hash32(seed ^ 0xA511E9B3U); }
+static uint32_t seed_p_of(uint32_t seed) { return hash32(seed ^ 0x6C8E9CF5U); }
+
+static void fused_scalar(void* p, uint8_t* plo, int pt, const void* g, int gt, void* m, void* v, int mvt,
                          void* out, int ot, int64_t n, uint64_t off, const adambridge_hparams* h)
 {
-    const uint32_t s_m = h->seed, s_v = seed_v_of(h->seed);
+    const uint32_t s_m = h->seed, s_v = seed_v_of(h->seed), s_p = seed_p_of(h->seed);
     for (int64_t i = 0; i < n; ++i) {
         const float gi = load_scalar(g, gt, i);
         float mi = load_scalar(m, mvt, i);
         float vi = load_scalar(v, mvt, i);
-        float pi = p[i] * h->decay;
+        float pi = load_master(p, plo, pt, i) * h->decay;
         mi = h->beta1 * mi + h->one_minus_beta1 * gi;
         vi = h->beta2 * vi + h->one_minus_beta2 * (gi * gi);
         pi -= h->step_size * (mi / (sqrtf(vi) * h->inv_sqrt_bc2 + h->eps));
-        p[i] = pi;
 
         const uint32_t idx = (uint32_t)(off + (uint64_t)i);
+        pi = store_master(p, plo, pt, i, pi, h->stochastic, pt == DT_F24 ? hash32(idx ^ s_p) : 0U);
         store_moment_scalar(m, mvt, i, mi, h->stochastic, hash32(idx ^ s_m));
         store_moment_scalar(v, mvt, i, vi, h->stochastic, hash32(idx ^ s_v));
         if (ot == DT_F32) ((float*)out)[i] = pi;
@@ -204,7 +248,57 @@ static inline void avx2_store_moment(void* base, int dt, int64_t i, __m256 x, in
 }
 
 ADAMBRIDGE_TARGET("avx2,fma")
-static void fused_avx2(float* p, const void* g, int gt, void* m, void* v, int mvt,
+static inline void avx2_store_codes(uint8_t* dst, __m256i codes)  /* 8 lanes in 0..255 -> 8 bytes */
+{
+    const __m128i w = _mm_packus_epi32(_mm256_castsi256_si128(codes), _mm256_extracti128_si256(codes, 1));
+    _mm_storel_epi64((__m128i*)dst, _mm_packus_epi16(w, w));
+}
+
+ADAMBRIDGE_TARGET("avx2,fma")
+static inline __m256 avx2_load_master(const void* p, const uint8_t* plo, int pt, int64_t i)
+{
+    if (pt == DT_F24) {
+        const __m256i hi = _mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*)((const uint16_t*)p + i))), 16);
+        const __m256i lo = _mm256_slli_epi32(_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*)(plo + i))), 8);
+        return _mm256_castsi256_ps(_mm256_or_si256(hi, lo));
+    }
+    return _mm256_loadu_ps((const float*)p + i);
+}
+
+/* f24_round_bits on 8 lanes. */
+ADAMBRIDGE_TARGET("avx2,fma")
+static inline __m256i avx2_round_f24(__m256 x, int sr, __m256i idx, __m256i seed)
+{
+    const __m256i bits = _mm256_castps_si256(x);
+    __m256i rounded;
+    if (sr) {
+        rounded = _mm256_add_epi32(bits, _mm256_and_si256(avx2_hash(_mm256_xor_si256(idx, seed)), _mm256_set1_epi32(0xff)));
+    } else {
+        const __m256i lsb = _mm256_and_si256(_mm256_srli_epi32(bits, 8), _mm256_set1_epi32(1));
+        rounded = _mm256_add_epi32(bits, _mm256_add_epi32(lsb, _mm256_set1_epi32(0x7f)));
+    }
+    rounded = _mm256_andnot_si256(_mm256_set1_epi32(0xff), rounded);
+    const __m256i qnan = _mm256_or_si256(bits, _mm256_set1_epi32(0x00400000));
+    const __m256 is_nan = _mm256_cmp_ps(x, x, _CMP_UNORD_Q);
+    return _mm256_castps_si256(_mm256_blendv_ps(_mm256_castsi256_ps(rounded), _mm256_castsi256_ps(qnan), is_nan));
+}
+
+/* Store 8 master lanes; returns the values stored. */
+ADAMBRIDGE_TARGET("avx2,fma")
+static inline __m256 avx2_store_master(void* p, uint8_t* plo, int pt, int64_t i, __m256 x, int sr, __m256i idx, __m256i seed)
+{
+    if (pt == DT_F24) {
+        const __m256i bits = avx2_round_f24(x, sr, idx, seed);
+        _mm_storeu_si128((__m128i*)((uint16_t*)p + i), avx2_pack_hi16(bits));
+        avx2_store_codes(plo + i, _mm256_and_si256(_mm256_srli_epi32(bits, 8), _mm256_set1_epi32(0xff)));
+        return _mm256_castsi256_ps(bits);
+    }
+    _mm256_storeu_ps((float*)p + i, x);
+    return x;
+}
+
+ADAMBRIDGE_TARGET("avx2,fma")
+static void fused_avx2(void* p, uint8_t* plo, int pt, const void* g, int gt, void* m, void* v, int mvt,
                        void* out, int ot, int64_t n, uint64_t off, const adambridge_hparams* h)
 {
     const __m256 b1 = _mm256_set1_ps(h->beta1), b2 = _mm256_set1_ps(h->beta2);
@@ -212,6 +306,7 @@ static void fused_avx2(float* p, const void* g, int gt, void* m, void* v, int mv
     const __m256 decay = _mm256_set1_ps(h->decay), step = _mm256_set1_ps(h->step_size);
     const __m256 isbc2 = _mm256_set1_ps(h->inv_sqrt_bc2), eps = _mm256_set1_ps(h->eps);
     const __m256i s_m = _mm256_set1_epi32((int)h->seed), s_v = _mm256_set1_epi32((int)seed_v_of(h->seed));
+    const __m256i s_p = _mm256_set1_epi32((int)seed_p_of(h->seed));
     const __m256i lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
     const int sr = h->stochastic;
 
@@ -220,22 +315,22 @@ static void fused_avx2(float* p, const void* g, int gt, void* m, void* v, int mv
         const __m256 vg = avx2_load(g, gt, i);
         __m256 vm = avx2_load(m, mvt, i);
         __m256 vv = avx2_load(v, mvt, i);
-        __m256 vp = _mm256_mul_ps(_mm256_loadu_ps(p + i), decay);
+        __m256 vp = _mm256_mul_ps(avx2_load_master(p, plo, pt, i), decay);
 
         vm = _mm256_fmadd_ps(b1, vm, _mm256_mul_ps(omb1, vg));
         vv = _mm256_fmadd_ps(b2, vv, _mm256_mul_ps(omb2, _mm256_mul_ps(vg, vg)));
         const __m256 denom = _mm256_fmadd_ps(_mm256_sqrt_ps(vv), isbc2, eps);
         vp = _mm256_fnmadd_ps(step, _mm256_div_ps(vm, denom), vp);
-        _mm256_storeu_ps(p + i, vp);
 
         const __m256i idx = _mm256_add_epi32(_mm256_set1_epi32((int)(uint32_t)(off + (uint64_t)i)), lane);
+        vp = avx2_store_master(p, plo, pt, i, vp, sr, idx, s_p);
         avx2_store_moment(m, mvt, i, vm, sr, idx, s_m);
         avx2_store_moment(v, mvt, i, vv, sr, idx, s_v);
         if (ot == DT_F32) _mm256_storeu_ps((float*)out + i, vp);
         else if (ot == DT_BF16) _mm_storeu_si128((__m128i*)((uint16_t*)out + i), avx2_pack_hi16(avx2_round_rne(vp)));
     }
     if (i < n)
-        fused_scalar(p + i, cadv(g, gt, i), gt, adv(m, mvt, i), adv(v, mvt, i), mvt,
+        fused_scalar(padv(p, pt, i), ladv(plo, i), pt, cadv(g, gt, i), gt, adv(m, mvt, i), adv(v, mvt, i), mvt,
                      adv(out, ot, i), ot, n - i, off + (uint64_t)i, h);
 }
 
@@ -294,7 +389,48 @@ static inline void avx512_store_moment(void* base, int dt, int64_t i, __m512 x, 
 }
 
 ADAMBRIDGE_TARGET(ADAMBRIDGE_AVX512)
-static void fused_avx512(float* p, const void* g, int gt, void* m, void* v, int mvt,
+static inline __m512 avx512_load_master(const void* p, const uint8_t* plo, int pt, int64_t i)
+{
+    if (pt == DT_F24) {
+        const __m512i hi = _mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i*)((const uint16_t*)p + i))), 16);
+        const __m512i lo = _mm512_slli_epi32(_mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*)(plo + i))), 8);
+        return _mm512_castsi512_ps(_mm512_or_si512(hi, lo));
+    }
+    return _mm512_loadu_ps((const float*)p + i);
+}
+
+ADAMBRIDGE_TARGET(ADAMBRIDGE_AVX512)
+static inline __m512i avx512_round_f24(__m512 x, int sr, __m512i idx, __m512i seed)
+{
+    const __m512i bits = _mm512_castps_si512(x);
+    __m512i rounded;
+    if (sr) {
+        rounded = _mm512_add_epi32(bits, _mm512_and_si512(avx512_hash(_mm512_xor_si512(idx, seed)), _mm512_set1_epi32(0xff)));
+    } else {
+        const __m512i lsb = _mm512_and_si512(_mm512_srli_epi32(bits, 8), _mm512_set1_epi32(1));
+        rounded = _mm512_add_epi32(bits, _mm512_add_epi32(lsb, _mm512_set1_epi32(0x7f)));
+    }
+    rounded = _mm512_andnot_si512(_mm512_set1_epi32(0xff), rounded);
+    const __mmask16 is_nan = _mm512_cmp_ps_mask(x, x, _CMP_UNORD_Q);
+    return _mm512_mask_mov_epi32(rounded, is_nan, _mm512_or_si512(bits, _mm512_set1_epi32(0x00400000)));
+}
+
+ADAMBRIDGE_TARGET(ADAMBRIDGE_AVX512)
+static inline __m512 avx512_store_master(void* p, uint8_t* plo, int pt, int64_t i, __m512 x, int sr, __m512i idx, __m512i seed)
+{
+    if (pt == DT_F24) {
+        const __m512i bits = avx512_round_f24(x, sr, idx, seed);
+        /* VPMOVDW / VPMOVDB truncate each lane: the high and the middle byte land as they are */
+        _mm256_storeu_si256((__m256i*)((uint16_t*)p + i), _mm512_cvtepi32_epi16(_mm512_srli_epi32(bits, 16)));
+        _mm_storeu_si128((__m128i*)(plo + i), _mm512_cvtepi32_epi8(_mm512_srli_epi32(bits, 8)));
+        return _mm512_castsi512_ps(bits);
+    }
+    _mm512_storeu_ps((float*)p + i, x);
+    return x;
+}
+
+ADAMBRIDGE_TARGET(ADAMBRIDGE_AVX512)
+static void fused_avx512(void* p, uint8_t* plo, int pt, const void* g, int gt, void* m, void* v, int mvt,
                          void* out, int ot, int64_t n, uint64_t off, const adambridge_hparams* h)
 {
     const __m512 b1 = _mm512_set1_ps(h->beta1), b2 = _mm512_set1_ps(h->beta2);
@@ -302,6 +438,7 @@ static void fused_avx512(float* p, const void* g, int gt, void* m, void* v, int 
     const __m512 decay = _mm512_set1_ps(h->decay), step = _mm512_set1_ps(h->step_size);
     const __m512 isbc2 = _mm512_set1_ps(h->inv_sqrt_bc2), eps = _mm512_set1_ps(h->eps);
     const __m512i s_m = _mm512_set1_epi32((int)h->seed), s_v = _mm512_set1_epi32((int)seed_v_of(h->seed));
+    const __m512i s_p = _mm512_set1_epi32((int)seed_p_of(h->seed));
     const __m512i lane = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
     const int sr = h->stochastic;
 
@@ -310,22 +447,22 @@ static void fused_avx512(float* p, const void* g, int gt, void* m, void* v, int 
         const __m512 vg = avx512_load(g, gt, i);
         __m512 vm = avx512_load(m, mvt, i);
         __m512 vv = avx512_load(v, mvt, i);
-        __m512 vp = _mm512_mul_ps(_mm512_loadu_ps(p + i), decay);
+        __m512 vp = _mm512_mul_ps(avx512_load_master(p, plo, pt, i), decay);
 
         vm = _mm512_fmadd_ps(b1, vm, _mm512_mul_ps(omb1, vg));
         vv = _mm512_fmadd_ps(b2, vv, _mm512_mul_ps(omb2, _mm512_mul_ps(vg, vg)));
         const __m512 denom = _mm512_fmadd_ps(_mm512_sqrt_ps(vv), isbc2, eps);
         vp = _mm512_fnmadd_ps(step, _mm512_div_ps(vm, denom), vp);
-        _mm512_storeu_ps(p + i, vp);
 
         const __m512i idx = _mm512_add_epi32(_mm512_set1_epi32((int)(uint32_t)(off + (uint64_t)i)), lane);
+        vp = avx512_store_master(p, plo, pt, i, vp, sr, idx, s_p);
         avx512_store_moment(m, mvt, i, vm, sr, idx, s_m);
         avx512_store_moment(v, mvt, i, vv, sr, idx, s_v);
         if (ot == DT_F32) _mm512_storeu_ps((float*)out + i, vp);
         else if (ot == DT_BF16) avx512_store_bf16(out, i, avx512_round_rne(vp));
     }
     if (i < n)
-        fused_scalar(p + i, cadv(g, gt, i), gt, adv(m, mvt, i), adv(v, mvt, i), mvt,
+        fused_scalar(padv(p, pt, i), ladv(plo, i), pt, cadv(g, gt, i), gt, adv(m, mvt, i), adv(v, mvt, i), mvt,
                      adv(out, ot, i), ot, n - i, off + (uint64_t)i, h);
 }
 
@@ -391,7 +528,46 @@ static inline void neon_store_moment(void* base, int dt, int64_t i, float32x4_t 
     vst1_u16((uint16_t*)base + i, vshrn_n_u32(bits, 16));
 }
 
-static void fused_neon(float* p, const void* g, int gt, void* m, void* v, int mvt,
+static inline float32x4_t neon_load_master(const void* p, const uint8_t* plo, int pt, int64_t i)
+{
+    if (pt == DT_F24) {
+        const uint32x4_t hi = vshll_n_u16(vld1_u16((const uint16_t*)p + i), 16);
+        uint32_t four;
+        memcpy(&four, plo + i, 4);   /* exactly 4 bytes: a vld1_u8 would read past the end of the plane */
+        const uint8x8_t b8 = vreinterpret_u8_u32(vdup_n_u32(four));
+        const uint32x4_t lo = vshlq_n_u32(vmovl_u16(vget_low_u16(vmovl_u8(b8))), 8);
+        return vreinterpretq_f32_u32(vorrq_u32(hi, lo));
+    }
+    return vld1q_f32((const float*)p + i);
+}
+
+static inline uint32x4_t neon_round_f24(float32x4_t x, int sr, uint32x4_t idx, uint32x4_t seed)
+{
+    const uint32x4_t bits = vreinterpretq_u32_f32(x);
+    uint32x4_t rounded;
+    if (sr) rounded = vaddq_u32(bits, vandq_u32(neon_hash(veorq_u32(idx, seed)), vdupq_n_u32(0xff)));
+    else rounded = vaddq_u32(bits, vaddq_u32(vandq_u32(vshrq_n_u32(bits, 8), vdupq_n_u32(1)), vdupq_n_u32(0x7f)));
+    rounded = vbicq_u32(rounded, vdupq_n_u32(0xff));
+    const uint32x4_t is_nan = vmvnq_u32(vceqq_f32(x, x));
+    return vbslq_u32(is_nan, vorrq_u32(bits, vdupq_n_u32(0x00400000)), rounded);
+}
+
+static inline float32x4_t neon_store_master(void* p, uint8_t* plo, int pt, int64_t i, float32x4_t x, int sr, uint32x4_t idx, uint32x4_t seed)
+{
+    if (pt == DT_F24) {
+        const uint32x4_t bits = neon_round_f24(x, sr, idx, seed);
+        vst1_u16((uint16_t*)p + i, vshrn_n_u32(bits, 16));
+        const uint16x4_t mid = vmovn_u32(vshrq_n_u32(bits, 8));   /* bits 8..23 of each lane */
+        const uint8x8_t b8 = vmovn_u16(vcombine_u16(mid, mid));    /* their low bytes: b0 b1 b2 b3 b0 b1 b2 b3 */
+        const uint32_t four = vget_lane_u32(vreinterpret_u32_u8(b8), 0);
+        memcpy(plo + i, &four, 4);
+        return vreinterpretq_f32_u32(bits);
+    }
+    vst1q_f32((float*)p + i, x);
+    return x;
+}
+
+static void fused_neon(void* p, uint8_t* plo, int pt, const void* g, int gt, void* m, void* v, int mvt,
                        void* out, int ot, int64_t n, uint64_t off, const adambridge_hparams* h)
 {
     const float32x4_t b1 = vdupq_n_f32(h->beta1), b2 = vdupq_n_f32(h->beta2);
@@ -399,6 +575,7 @@ static void fused_neon(float* p, const void* g, int gt, void* m, void* v, int mv
     const float32x4_t decay = vdupq_n_f32(h->decay), step = vdupq_n_f32(h->step_size);
     const float32x4_t isbc2 = vdupq_n_f32(h->inv_sqrt_bc2), eps = vdupq_n_f32(h->eps);
     const uint32x4_t s_m = vdupq_n_u32(h->seed), s_v = vdupq_n_u32(seed_v_of(h->seed));
+    const uint32x4_t s_p = vdupq_n_u32(seed_p_of(h->seed));
     static const uint32_t lane_init[4] = {0, 1, 2, 3};
     const uint32x4_t lane = vld1q_u32(lane_init);
     const int sr = h->stochastic;
@@ -408,22 +585,22 @@ static void fused_neon(float* p, const void* g, int gt, void* m, void* v, int mv
         const float32x4_t vg = neon_load(g, gt, i);
         float32x4_t vm = neon_load(m, mvt, i);
         float32x4_t vv = neon_load(v, mvt, i);
-        float32x4_t vp = vmulq_f32(vld1q_f32(p + i), decay);
+        float32x4_t vp = vmulq_f32(neon_load_master(p, plo, pt, i), decay);
 
         vm = vfmaq_f32(vmulq_f32(omb1, vg), b1, vm);
         vv = vfmaq_f32(vmulq_f32(omb2, vmulq_f32(vg, vg)), b2, vv);
         const float32x4_t denom = vfmaq_f32(eps, vsqrtq_f32(vv), isbc2);
         vp = vfmsq_f32(vp, step, vdivq_f32(vm, denom));
-        vst1q_f32(p + i, vp);
 
         const uint32x4_t idx = vaddq_u32(vdupq_n_u32((uint32_t)(off + (uint64_t)i)), lane);
+        vp = neon_store_master(p, plo, pt, i, vp, sr, idx, s_p);
         neon_store_moment(m, mvt, i, vm, sr, idx, s_m);
         neon_store_moment(v, mvt, i, vv, sr, idx, s_v);
         if (ot == DT_F32) vst1q_f32((float*)out + i, vp);
         else if (ot == DT_BF16) vst1_u16((uint16_t*)out + i, vshrn_n_u32(neon_round_rne(vp), 16));
     }
     if (i < n)
-        fused_scalar(p + i, cadv(g, gt, i), gt, adv(m, mvt, i), adv(v, mvt, i), mvt,
+        fused_scalar(padv(p, pt, i), ladv(plo, i), pt, cadv(g, gt, i), gt, adv(m, mvt, i), adv(v, mvt, i), mvt,
                      adv(out, ot, i), ot, n - i, off + (uint64_t)i, h);
 }
 
@@ -537,18 +714,18 @@ static void ensure_init(void)
     ax_store(&g_ready, 1);
 }
 
-static void fused_dispatch(float* p, const void* g, int gt, void* m, void* v, int mvt,
+static void fused_dispatch(void* p, uint8_t* plo, int pt, const void* g, int gt, void* m, void* v, int mvt,
                            void* out, int ot, int64_t n, uint64_t off, const adambridge_hparams* h)
 {
     switch (g_active) {
 #if defined(ADAMBRIDGE_X86)
-    case SIMD_AVX512: fused_avx512(p, g, gt, m, v, mvt, out, ot, n, off, h); break;
-    case SIMD_AVX2:   fused_avx2(p, g, gt, m, v, mvt, out, ot, n, off, h); break;
+    case SIMD_AVX512: fused_avx512(p, plo, pt, g, gt, m, v, mvt, out, ot, n, off, h); break;
+    case SIMD_AVX2:   fused_avx2(p, plo, pt, g, gt, m, v, mvt, out, ot, n, off, h); break;
 #endif
 #if defined(ADAMBRIDGE_NEON)
-    case SIMD_NEON:   fused_neon(p, g, gt, m, v, mvt, out, ot, n, off, h); break;
+    case SIMD_NEON:   fused_neon(p, plo, pt, g, gt, m, v, mvt, out, ot, n, off, h); break;
 #endif
-    default:          fused_scalar(p, g, gt, m, v, mvt, out, ot, n, off, h); break;
+    default:          fused_scalar(p, plo, pt, g, gt, m, v, mvt, out, ot, n, off, h); break;
     }
 }
 
@@ -568,7 +745,8 @@ typedef struct adambridge_group {
 } adambridge_group;
 
 typedef struct adambridge_segment {
-    float* p;                /* FP32 master weights */
+    void* p;                 /* master weights: FP32 values, or the FP24 hi plane (uint16) when p_dtype is DT_F24 */
+    uint8_t* p_lo;           /* FP24 only: the lo plane (one byte per element); NULL for FP32 */
     const void* g;           /* gradient (g_dtype) */
     void* m;                 /* first moment (mv_dtype; FP8: E4M3 codes) */
     void* v;                 /* second moment (mv_dtype; FP8: E5M2 codes of sqrt(v)) */
@@ -585,8 +763,12 @@ typedef struct adambridge_segment {
     int32_t g_dtype;
     int32_t mv_dtype;
     int32_t out_dtype;
+    int32_t algorithm;       /* ALGO_ADAMW, or ALGO_LION (v and v_scale unused, may be NULL) */
+    int32_t p_dtype;         /* DT_F32 (or 0, the default) or DT_F24 */
     int32_t reserved;
 } adambridge_segment;
+
+static inline int master_type(const adambridge_segment* s) { return s->p_dtype == DT_F24 ? DT_F24 : DT_F32; }
 
 /* Same mixing as adambridge.kernels.mix_seed(seed, index, step). */
 static uint64_t mix64(uint64_t h, uint64_t v)
@@ -619,7 +801,7 @@ static void hparams_for(const adambridge_segment* s, adambridge_hparams* h)
     h->one_minus_beta1 = (float)(1.0 - G->beta1);
     h->one_minus_beta2 = (float)(1.0 - G->beta2);
     h->decay = (float)(1.0 - G->lr * G->weight_decay);
-    h->step_size = (float)(G->lr / bc1);
+    h->step_size = (float)(s->algorithm == ALGO_LION ? G->lr : G->lr / bc1);
     h->inv_sqrt_bc2 = (float)(1.0 / sqrt(bc2));
     h->eps = (float)G->eps;
     h->seed = step_seed(G->seed, s->index, s->step);
@@ -693,40 +875,183 @@ static inline uint32_t fp8_encode(float x, int sr, uint32_t r, int mbits, int bi
     return sign | (is_nan ? nan_code : code);
 }
 
+/* The three per-block steps around the update: decode the codes to FP32,
+ * take sqrt(v) and both block maxima, re-encode with the new scales. The
+ * generic versions are plain loops; clang vectorizes them, but gcc keeps the
+ * table lookups and the encoder scalar, which made FP8 moments slower than
+ * BF16 moments in gcc builds (10.9 vs 8.1 ms at 32M parameters; clang build:
+ * 7.1 vs 7.9 ms). The AVX2 versions do the same operations with intrinsics
+ * and give the same codes bit for bit (checked by the self-test). */
+static inline void fp8_decode_block(const uint8_t* mq, const uint8_t* vq, float sm, float sv,
+                                    float* mt, float* vt, int nb)
+{
+    for (int k = 0; k < nb; ++k) mt[k] = g_lut_e4m3[mq[k]] * sm;
+    for (int k = 0; k < nb; ++k) { const float u = g_lut_e5m2[vq[k]] * sv; vt[k] = u * u; }
+}
+
+/* vt <- sqrt(max(vt, 0)); *am <- max |mt|, *au <- max vt (both >= 0, NaN skipped). */
+static inline void fp8_absmax_block(const float* mt, float* vt, int nb, float* am_out, float* au_out)
+{
+    float am = 0.0f, au = 0.0f;
+    for (int k = 0; k < nb; ++k) {
+        const float a = fabsf(mt[k]);
+        const float u = sqrtf(vt[k] > 0.0f ? vt[k] : 0.0f);
+        vt[k] = u;
+        am = a > am ? a : am;
+        au = u > au ? u : au;
+    }
+    *am_out = am;
+    *au_out = au;
+}
+
+static inline void fp8_encode_block(const float* mt, const float* vt, float scm, float scu, int sr, uint32_t idx0,
+                                    uint32_t s_m, uint32_t s_v, uint8_t* mq, uint8_t* vq, int nb)
+{
+    for (int k = 0; k < nb; ++k) {
+        const uint32_t idx = idx0 + (uint32_t)k;
+        mq[k] = (uint8_t)fp8_encode(mt[k] / scm, sr, hash32(idx ^ s_m), 3, 7, 448.0f, 0x7fu);
+        vq[k] = (uint8_t)fp8_encode(vt[k] / scu, sr, hash32(idx ^ s_v), 2, 15, 57344.0f, 0x7eu);
+    }
+}
+
+#if defined(ADAMBRIDGE_X86)
+ADAMBRIDGE_TARGET("avx2,fma")
+static inline void fp8_decode_block_avx2(const uint8_t* mq, const uint8_t* vq, float sm, float sv,
+                                         float* mt, float* vt, int nb)
+{
+    const __m256 vsm = _mm256_set1_ps(sm), vsv = _mm256_set1_ps(sv);
+    int k = 0;
+    for (; k + 8 <= nb; k += 8) {
+        const __m256i cm = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*)(mq + k)));
+        const __m256i cv = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*)(vq + k)));
+        _mm256_storeu_ps(mt + k, _mm256_mul_ps(_mm256_i32gather_ps(g_lut_e4m3, cm, 4), vsm));
+        const __m256 u = _mm256_mul_ps(_mm256_i32gather_ps(g_lut_e5m2, cv, 4), vsv);
+        _mm256_storeu_ps(vt + k, _mm256_mul_ps(u, u));
+    }
+    for (; k < nb; ++k) {
+        mt[k] = g_lut_e4m3[mq[k]] * sm;
+        const float u = g_lut_e5m2[vq[k]] * sv;
+        vt[k] = u * u;
+    }
+}
+
+ADAMBRIDGE_TARGET("avx2,fma")
+static inline void fp8_absmax_block_avx2(const float* mt, float* vt, int nb, float* am_out, float* au_out)
+{
+    const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff)), zero = _mm256_setzero_ps();
+    __m256 vam = zero, vau = zero;
+    int k = 0;
+    for (; k + 8 <= nb; k += 8) {
+        const __m256 a = _mm256_and_ps(_mm256_loadu_ps(mt + k), absmask);
+        const __m256 u = _mm256_sqrt_ps(_mm256_max_ps(_mm256_loadu_ps(vt + k), zero));  /* v > 0 ? v : 0 */
+        _mm256_storeu_ps(vt + k, u);
+        vam = _mm256_max_ps(a, vam);  /* a > am ? a : am: a NaN lane keeps am */
+        vau = _mm256_max_ps(u, vau);
+    }
+    AX_ALIGN64 float lm[8], lu[8];
+    _mm256_store_ps(lm, vam);
+    _mm256_store_ps(lu, vau);
+    float am = 0.0f, au = 0.0f;  /* lanes are >= 0 and never NaN, so the order of the maxima is irrelevant */
+    for (int i = 0; i < 8; ++i) {
+        am = lm[i] > am ? lm[i] : am;
+        au = lu[i] > au ? lu[i] : au;
+    }
+    for (; k < nb; ++k) {
+        const float a = fabsf(mt[k]);
+        const float u = sqrtf(vt[k] > 0.0f ? vt[k] : 0.0f);
+        vt[k] = u;
+        am = a > am ? a : am;
+        au = u > au ? u : au;
+    }
+    *am_out = am;
+    *au_out = au;
+}
+
+/* fp8_encode on 8 lanes: the same integer and float operations, in the same order. */
+ADAMBRIDGE_TARGET("avx2,fma")
+static inline __m256i fp8_encode_avx2(__m256 x, int sr, __m256i r, int mbits, int bias, float fmax, uint32_t nan_code)
+{
+    const int drop = 23 - mbits;
+    const __m128i cdrop = _mm_cvtsi32_si128(drop), cmbits = _mm_cvtsi32_si128(mbits);
+    const __m256i low = _mm256_set1_epi32((int)((1u << drop) - 1u));
+    const __m256i one = _mm256_set1_epi32(1), absbits = _mm256_set1_epi32(0x7fffffff);
+    const __m256i b = _mm256_castps_si256(x);
+    const __m256i sign = _mm256_and_si256(_mm256_srli_epi32(b, 24), _mm256_set1_epi32(0x80));
+    /* |b| < 2^31, so the signed compare is the unsigned one */
+    const __m256i is_nan = _mm256_cmpgt_epi32(_mm256_and_si256(b, absbits), _mm256_set1_epi32(0x7f800000));
+    const __m256i t = sr ? _mm256_andnot_si256(low, _mm256_add_epi32(b, _mm256_and_si256(r, low))) : b;
+    /* a > fmax ? fmax : a (a NaN stays NaN) */
+    const __m256 a = _mm256_min_ps(_mm256_set1_ps(fmax), _mm256_castsi256_ps(_mm256_and_si256(t, absbits)));
+    const __m256i ab = _mm256_castps_si256(a);
+    const __m256i rn = sr ? ab : _mm256_add_epi32(_mm256_add_epi32(ab, _mm256_srli_epi32(low, 1)),
+                                                  _mm256_and_si256(_mm256_srl_epi32(ab, cdrop), one));
+    const __m256i expo = _mm256_and_si256(_mm256_srli_epi32(rn, 23), _mm256_set1_epi32(0xff));
+    const __m256i normal = _mm256_or_si256(
+        _mm256_sll_epi32(_mm256_add_epi32(expo, _mm256_set1_epi32(bias - 127)), cmbits),
+        _mm256_and_si256(_mm256_srl_epi32(rn, cdrop), _mm256_set1_epi32((1 << mbits) - 1)));
+    const __m256 sub_scale = _mm256_set1_ps(bits_f32((uint32_t)(127 + bias + mbits - 1) << 23));
+    const __m256i sub = _mm256_sub_epi32(  /* RNE to integer; the product is exact, so no FMA question */
+        _mm256_castps_si256(_mm256_add_ps(_mm256_mul_ps(a, sub_scale), _mm256_set1_ps(8388608.0f))),
+        _mm256_set1_epi32(0x4b000000));
+    const __m256 min_normal = _mm256_set1_ps(bits_f32((uint32_t)(127 + 1 - bias) << 23));
+    const __m256i is_normal = _mm256_castps_si256(_mm256_cmp_ps(a, min_normal, _CMP_GE_OQ));
+    const __m256i code = _mm256_blendv_epi8(sub, normal, is_normal);
+    return _mm256_or_si256(sign, _mm256_blendv_epi8(code, _mm256_set1_epi32((int)nan_code), is_nan));
+}
+
+ADAMBRIDGE_TARGET("avx2,fma")
+static inline void fp8_encode_block_avx2(const float* mt, const float* vt, float scm, float scu, int sr,
+                                         uint32_t idx0, uint32_t s_m, uint32_t s_v, uint8_t* mq, uint8_t* vq, int nb)
+{
+    const __m256 vscm = _mm256_set1_ps(scm), vscu = _mm256_set1_ps(scu);
+    const __m256i lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    const __m256i vsm = _mm256_set1_epi32((int)s_m), vsv = _mm256_set1_epi32((int)s_v);
+    int k = 0;
+    for (; k + 8 <= nb; k += 8) {
+        __m256i rm = _mm256_setzero_si256(), rv = rm;
+        if (sr) {
+            const __m256i idx = _mm256_add_epi32(_mm256_set1_epi32((int)(idx0 + (uint32_t)k)), lane);
+            rm = avx2_hash(_mm256_xor_si256(idx, vsm));
+            rv = avx2_hash(_mm256_xor_si256(idx, vsv));
+        }
+        avx2_store_codes(mq + k, fp8_encode_avx2(_mm256_div_ps(_mm256_loadu_ps(mt + k), vscm), sr, rm,
+                                                 3, 7, 448.0f, 0x7fu));
+        avx2_store_codes(vq + k, fp8_encode_avx2(_mm256_div_ps(_mm256_loadu_ps(vt + k), vscu), sr, rv,
+                                                 2, 15, 57344.0f, 0x7eu));
+    }
+    for (; k < nb; ++k) {
+        const uint32_t idx = idx0 + (uint32_t)k;
+        mq[k] = (uint8_t)fp8_encode(mt[k] / scm, sr, hash32(idx ^ s_m), 3, 7, 448.0f, 0x7fu);
+        vq[k] = (uint8_t)fp8_encode(vt[k] / scu, sr, hash32(idx ^ s_v), 2, 15, 57344.0f, 0x7eu);
+    }
+}
+#endif
+
 /* One segment range [lo, hi): lo is a multiple of FP8_BLOCK, hi is a multiple
  * or the end of the segment. Each block is decoded to FP32, updated by the
- * regular SIMD kernel, re-scaled and re-encoded. */
-#define FP8_RANGE_BODY(FUSED)                                                                    \
+ * regular SIMD kernel, re-scaled and re-encoded. BLK picks the block steps
+ * (empty: the generic loops; _avx2: intrinsics). */
+#define FP8_RANGE_BODY(FUSED, BLK)                                                               \
 {                                                                                                \
     AX_ALIGN64 float mt[FP8_BLOCK];                                                              \
     AX_ALIGN64 float vt[FP8_BLOCK];                                                              \
     uint8_t* mq = (uint8_t*)s->m;                                                                \
     uint8_t* vq = (uint8_t*)s->v;                                                                \
     const uint32_t s_m = h->seed, s_v = seed_v_of(h->seed);                                      \
-    const int sr = h->stochastic;                                                                \
+    const int sr = h->stochastic, pt = master_type(s);                                           \
     for (int64_t b0 = lo; b0 < hi; b0 += FP8_BLOCK) {                                           \
         const int nb = (int)(hi - b0 < FP8_BLOCK ? hi - b0 : FP8_BLOCK);                         \
         const int64_t blk = b0 / FP8_BLOCK;                                                      \
-        const float sm = s->m_scale[blk], sv = s->v_scale[blk];                                  \
-        for (int k = 0; k < nb; ++k) mt[k] = g_lut_e4m3[mq[b0 + k]] * sm;                        \
-        for (int k = 0; k < nb; ++k) { const float u = g_lut_e5m2[vq[b0 + k]] * sv; vt[k] = u * u; } \
-        FUSED(s->p + b0, cadv(s->g, s->g_dtype, b0), s->g_dtype, mt, vt, DT_F32,                \
-              adv(s->out, s->out_dtype, b0), s->out_dtype, nb, (uint64_t)(s->offset + b0), h);  \
-        float am = 0.0f, au = 0.0f;                                                              \
-        for (int k = 0; k < nb; ++k) {                                                           \
-            const float a = fabsf(mt[k]);                                                        \
-            const float u = sqrtf(vt[k] > 0.0f ? vt[k] : 0.0f);                                  \
-            vt[k] = u;                                                                           \
-            am = a > am ? a : am;                                                                \
-            au = u > au ? u : au;                                                                \
-        }                                                                                        \
+        fp8_decode_block##BLK(mq + b0, vq + b0, s->m_scale[blk], s->v_scale[blk], mt, vt, nb);  \
+        FUSED(padv(s->p, pt, b0), ladv(s->p_lo, b0), pt, cadv(s->g, s->g_dtype, b0), s->g_dtype, \
+              mt, vt, DT_F32, adv(s->out, s->out_dtype, b0), s->out_dtype, nb,                  \
+              (uint64_t)(s->offset + b0), h);                                                    \
+        float am, au;                                                                            \
+        fp8_absmax_block##BLK(mt, vt, nb, &am, &au);                                             \
         const float scm = am > 0.0f ? am / 448.0f : 1.0f;                                        \
         const float scu = au > 0.0f ? au / 57344.0f : 1.0f;                                      \
-        for (int k = 0; k < nb; ++k) {                                                           \
-            const uint32_t idx = (uint32_t)(s->offset + b0 + k);                                 \
-            mq[b0 + k] = (uint8_t)fp8_encode(mt[k] / scm, sr, hash32(idx ^ s_m), 3, 7, 448.0f, 0x7fu); \
-            vq[b0 + k] = (uint8_t)fp8_encode(vt[k] / scu, sr, hash32(idx ^ s_v), 2, 15, 57344.0f, 0x7eu); \
-        }                                                                                        \
+        fp8_encode_block##BLK(mt, vt, scm, scu, sr, (uint32_t)(s->offset + b0), s_m, s_v,       \
+                              mq + b0, vq + b0, nb);                                             \
         for (int k = nb; k < FP8_BLOCK; ++k) { mq[b0 + k] = 0; vq[b0 + k] = 0; }               \
         s->m_scale[blk] = scm;                                                                   \
         s->v_scale[blk] = scu;                                                                   \
@@ -734,21 +1059,21 @@ static inline uint32_t fp8_encode(float x, int sr, uint32_t r, int mbits, int bi
 }
 
 static void fp8_range_scalar(const adambridge_segment* s, const adambridge_hparams* h, int64_t lo, int64_t hi)
-FP8_RANGE_BODY(fused_scalar)
+FP8_RANGE_BODY(fused_scalar, )
 
 #if defined(ADAMBRIDGE_X86)
 ADAMBRIDGE_TARGET("avx2,fma")
 static void fp8_range_avx2(const adambridge_segment* s, const adambridge_hparams* h, int64_t lo, int64_t hi)
-FP8_RANGE_BODY(fused_avx2)
+FP8_RANGE_BODY(fused_avx2, _avx2)
 
 ADAMBRIDGE_TARGET(ADAMBRIDGE_AVX512)
 static void fp8_range_avx512(const adambridge_segment* s, const adambridge_hparams* h, int64_t lo, int64_t hi)
-FP8_RANGE_BODY(fused_avx512)
+FP8_RANGE_BODY(fused_avx512, )
 #endif
 
 #if defined(ADAMBRIDGE_NEON)
 static void fp8_range_neon(const adambridge_segment* s, const adambridge_hparams* h, int64_t lo, int64_t hi)
-FP8_RANGE_BODY(fused_neon)
+FP8_RANGE_BODY(fused_neon, )
 #endif
 
 static void fp8_dispatch(const adambridge_segment* s, const adambridge_hparams* h, int64_t lo, int64_t hi)
@@ -762,6 +1087,181 @@ static void fp8_dispatch(const adambridge_segment* s, const adambridge_hparams* 
     case SIMD_NEON:   fp8_range_neon(s, h, lo, hi); break;
 #endif
     default:          fp8_range_scalar(s, h, lo, hi); break;
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Lion (Chen et al., 2023, "Symbolic Discovery of Optimization Algorithms") */
+/*                                                                           */
+/*   c = b1 * m + (1 - b1) * g                                               */
+/*   p = p * (1 - lr * wd) - lr * sign(c)                                    */
+/*   m = b2 * m + (1 - b2) * g                                               */
+/*                                                                           */
+/* One moment instead of two: 8 bytes of host state per parameter with FP32  */
+/* m (AdamW: 12), and less memory traffic per update. step_size holds lr     */
+/* (no bias correction). Every multiply-add is a single fused operation on   */
+/* every path, scalar included, so the sign of c -- and with it the update   */
+/* -- is bit-identical whatever the ISA. sign(0) = 0, as torch.sign.         */
+/* ------------------------------------------------------------------------- */
+
+static void lion_scalar(void* p, uint8_t* plo, int pt, const void* g, int gt, void* m, int mt,
+                        void* out, int ot, int64_t n, uint64_t off, const adambridge_hparams* h)
+{
+    const uint32_t s_p = seed_p_of(h->seed);
+    for (int64_t i = 0; i < n; ++i) {
+        const float gi = load_scalar(g, gt, i);
+        const float mi = load_scalar(m, mt, i);
+        const float ci = fmaf(h->beta1, mi, h->one_minus_beta1 * gi);
+        const float u = ci > 0.0f ? h->step_size : (ci < 0.0f ? -h->step_size : 0.0f);
+        const uint32_t idx = (uint32_t)(off + (uint64_t)i);
+        const float pi = store_master(p, plo, pt, i, fmaf(load_master(p, plo, pt, i), h->decay, -u), h->stochastic,
+                                      pt == DT_F24 ? hash32(idx ^ s_p) : 0U);
+
+        store_moment_scalar(m, mt, i, fmaf(h->beta2, mi, h->one_minus_beta2 * gi), h->stochastic, hash32(idx ^ h->seed));
+        if (ot == DT_F32) ((float*)out)[i] = pi;
+        else if (ot == DT_BF16) ((uint16_t*)out)[i] = (uint16_t)(bf16_round_bits(f32_bits(pi)) >> 16);
+    }
+}
+
+#if defined(ADAMBRIDGE_X86)
+ADAMBRIDGE_TARGET("avx2,fma")
+static void lion_avx2(void* p, uint8_t* plo, int pt, const void* g, int gt, void* m, int mt,
+                      void* out, int ot, int64_t n, uint64_t off, const adambridge_hparams* h)
+{
+    const __m256 b1 = _mm256_set1_ps(h->beta1), b2 = _mm256_set1_ps(h->beta2);
+    const __m256 omb1 = _mm256_set1_ps(h->one_minus_beta1), omb2 = _mm256_set1_ps(h->one_minus_beta2);
+    const __m256 decay = _mm256_set1_ps(h->decay), lr = _mm256_set1_ps(h->step_size);
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256i s_m = _mm256_set1_epi32((int)h->seed), s_p = _mm256_set1_epi32((int)seed_p_of(h->seed));
+    const __m256i lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    const int sr = h->stochastic;
+
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 vg = avx2_load(g, gt, i);
+        const __m256 vm = avx2_load(m, mt, i);
+        const __m256 vc = _mm256_fmadd_ps(b1, vm, _mm256_mul_ps(omb1, vg));
+        const __m256 upd = _mm256_sub_ps(_mm256_and_ps(_mm256_cmp_ps(vc, zero, _CMP_GT_OQ), lr),
+                                         _mm256_and_ps(_mm256_cmp_ps(vc, zero, _CMP_LT_OQ), lr));
+        const __m256i idx = _mm256_add_epi32(_mm256_set1_epi32((int)(uint32_t)(off + (uint64_t)i)), lane);
+        const __m256 vp = avx2_store_master(p, plo, pt, i, _mm256_fmsub_ps(avx2_load_master(p, plo, pt, i), decay, upd),
+                                            sr, idx, s_p);
+
+        avx2_store_moment(m, mt, i, _mm256_fmadd_ps(b2, vm, _mm256_mul_ps(omb2, vg)), sr, idx, s_m);
+        if (ot == DT_F32) _mm256_storeu_ps((float*)out + i, vp);
+        else if (ot == DT_BF16) _mm_storeu_si128((__m128i*)((uint16_t*)out + i), avx2_pack_hi16(avx2_round_rne(vp)));
+    }
+    if (i < n)
+        lion_scalar(padv(p, pt, i), ladv(plo, i), pt, cadv(g, gt, i), gt, adv(m, mt, i), mt, adv(out, ot, i), ot, n - i,
+                    off + (uint64_t)i, h);
+}
+
+ADAMBRIDGE_TARGET(ADAMBRIDGE_AVX512)
+static void lion_avx512(void* p, uint8_t* plo, int pt, const void* g, int gt, void* m, int mt,
+                        void* out, int ot, int64_t n, uint64_t off, const adambridge_hparams* h)
+{
+    const __m512 b1 = _mm512_set1_ps(h->beta1), b2 = _mm512_set1_ps(h->beta2);
+    const __m512 omb1 = _mm512_set1_ps(h->one_minus_beta1), omb2 = _mm512_set1_ps(h->one_minus_beta2);
+    const __m512 decay = _mm512_set1_ps(h->decay), lr = _mm512_set1_ps(h->step_size);
+    const __m512 zero = _mm512_setzero_ps();
+    const __m512i s_m = _mm512_set1_epi32((int)h->seed), s_p = _mm512_set1_epi32((int)seed_p_of(h->seed));
+    const __m512i lane = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    const int sr = h->stochastic;
+
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const __m512 vg = avx512_load(g, gt, i);
+        const __m512 vm = avx512_load(m, mt, i);
+        const __m512 vc = _mm512_fmadd_ps(b1, vm, _mm512_mul_ps(omb1, vg));
+        const __m512 upd = _mm512_sub_ps(_mm512_maskz_mov_ps(_mm512_cmp_ps_mask(vc, zero, _CMP_GT_OQ), lr),
+                                         _mm512_maskz_mov_ps(_mm512_cmp_ps_mask(vc, zero, _CMP_LT_OQ), lr));
+        const __m512i idx = _mm512_add_epi32(_mm512_set1_epi32((int)(uint32_t)(off + (uint64_t)i)), lane);
+        const __m512 vp = avx512_store_master(p, plo, pt, i, _mm512_fmsub_ps(avx512_load_master(p, plo, pt, i), decay, upd),
+                                              sr, idx, s_p);
+
+        avx512_store_moment(m, mt, i, _mm512_fmadd_ps(b2, vm, _mm512_mul_ps(omb2, vg)), sr, idx, s_m);
+        if (ot == DT_F32) _mm512_storeu_ps((float*)out + i, vp);
+        else if (ot == DT_BF16) avx512_store_bf16(out, i, avx512_round_rne(vp));
+    }
+    if (i < n)
+        lion_scalar(padv(p, pt, i), ladv(plo, i), pt, cadv(g, gt, i), gt, adv(m, mt, i), mt, adv(out, ot, i), ot, n - i,
+                    off + (uint64_t)i, h);
+}
+#endif /* ADAMBRIDGE_X86 */
+
+#if defined(ADAMBRIDGE_NEON)
+static void lion_neon(void* p, uint8_t* plo, int pt, const void* g, int gt, void* m, int mt,
+                      void* out, int ot, int64_t n, uint64_t off, const adambridge_hparams* h)
+{
+    const float32x4_t b1 = vdupq_n_f32(h->beta1), b2 = vdupq_n_f32(h->beta2);
+    const float32x4_t omb1 = vdupq_n_f32(h->one_minus_beta1), omb2 = vdupq_n_f32(h->one_minus_beta2);
+    const float32x4_t decay = vdupq_n_f32(h->decay);
+    const float32x4_t zero = vdupq_n_f32(0.0f);
+    const uint32x4_t lr = vreinterpretq_u32_f32(vdupq_n_f32(h->step_size));
+    const uint32x4_t s_m = vdupq_n_u32(h->seed), s_p = vdupq_n_u32(seed_p_of(h->seed));
+    static const uint32_t lane_init[4] = {0, 1, 2, 3};
+    const uint32x4_t lane = vld1q_u32(lane_init);
+    const int sr = h->stochastic;
+
+    int64_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        const float32x4_t vg = neon_load(g, gt, i);
+        const float32x4_t vm = neon_load(m, mt, i);
+        const float32x4_t vc = vfmaq_f32(vmulq_f32(omb1, vg), b1, vm);
+        const float32x4_t upd = vsubq_f32(vreinterpretq_f32_u32(vandq_u32(vcgtq_f32(vc, zero), lr)),
+                                          vreinterpretq_f32_u32(vandq_u32(vcltq_f32(vc, zero), lr)));
+        const uint32x4_t idx = vaddq_u32(vdupq_n_u32((uint32_t)(off + (uint64_t)i)), lane);
+        const float32x4_t vp = neon_store_master(p, plo, pt, i, vfmaq_f32(vnegq_f32(upd), neon_load_master(p, plo, pt, i), decay),
+                                                 sr, idx, s_p);
+
+        neon_store_moment(m, mt, i, vfmaq_f32(vmulq_f32(omb2, vg), b2, vm), sr, idx, s_m);
+        if (ot == DT_F32) vst1q_f32((float*)out + i, vp);
+        else if (ot == DT_BF16) vst1_u16((uint16_t*)out + i, vshrn_n_u32(neon_round_rne(vp), 16));
+    }
+    if (i < n)
+        lion_scalar(padv(p, pt, i), ladv(plo, i), pt, cadv(g, gt, i), gt, adv(m, mt, i), mt, adv(out, ot, i), ot, n - i,
+                    off + (uint64_t)i, h);
+}
+#endif /* ADAMBRIDGE_NEON */
+
+static void lion_dispatch(void* p, uint8_t* plo, int pt, const void* g, int gt, void* m, int mt,
+                          void* out, int ot, int64_t n, uint64_t off, const adambridge_hparams* h)
+{
+    switch (g_active) {
+#if defined(ADAMBRIDGE_X86)
+    case SIMD_AVX512: lion_avx512(p, plo, pt, g, gt, m, mt, out, ot, n, off, h); break;
+    case SIMD_AVX2:   lion_avx2(p, plo, pt, g, gt, m, mt, out, ot, n, off, h); break;
+#endif
+#if defined(ADAMBRIDGE_NEON)
+    case SIMD_NEON:   lion_neon(p, plo, pt, g, gt, m, mt, out, ot, n, off, h); break;
+#endif
+    default:          lion_scalar(p, plo, pt, g, gt, m, mt, out, ot, n, off, h); break;
+    }
+}
+
+/* Lion with FP8 m: the same block layout, codec and rounding stream as the
+ * AdamW first moment. */
+static void lion_fp8_range(const adambridge_segment* s, const adambridge_hparams* h, int64_t lo, int64_t hi)
+{
+    AX_ALIGN64 float mt[FP8_BLOCK];
+    uint8_t* mq = (uint8_t*)s->m;
+    const int sr = h->stochastic, pt = master_type(s);
+    for (int64_t b0 = lo; b0 < hi; b0 += FP8_BLOCK) {
+        const int nb = (int)(hi - b0 < FP8_BLOCK ? hi - b0 : FP8_BLOCK);
+        const int64_t blk = b0 / FP8_BLOCK;
+        const float sm = s->m_scale[blk];
+        for (int k = 0; k < nb; ++k) mt[k] = g_lut_e4m3[mq[b0 + k]] * sm;
+        lion_dispatch(padv(s->p, pt, b0), ladv(s->p_lo, b0), pt, cadv(s->g, s->g_dtype, b0), s->g_dtype, mt, DT_F32,
+                      adv(s->out, s->out_dtype, b0), s->out_dtype, nb, (uint64_t)(s->offset + b0), h);
+        float am = 0.0f;
+        for (int k = 0; k < nb; ++k) { const float a = fabsf(mt[k]); am = a > am ? a : am; }
+        const float scm = am > 0.0f ? am / 448.0f : 1.0f;
+        for (int k = 0; k < nb; ++k) {
+            const uint32_t idx = (uint32_t)(s->offset + b0 + k);
+            mq[b0 + k] = (uint8_t)fp8_encode(mt[k] / scm, sr, hash32(idx ^ h->seed), 3, 7, 448.0f, 0x7fu);
+        }
+        for (int k = nb; k < FP8_BLOCK; ++k) mq[b0 + k] = 0;
+        s->m_scale[blk] = scm;
     }
 }
 
@@ -785,11 +1285,19 @@ static void run_item(const ax_item* it)
 {
     const adambridge_segment* s = it->seg;
     const int64_t lo = it->lo;
+    const int pt = master_type(s);
+    if (s->algorithm == ALGO_LION) {
+        if (s->mv_dtype == DT_FP8) lion_fp8_range(s, it->h, lo, it->hi);
+        else lion_dispatch(padv(s->p, pt, lo), ladv(s->p_lo, lo), pt, cadv(s->g, s->g_dtype, lo), s->g_dtype,
+                           adv(s->m, s->mv_dtype, lo), s->mv_dtype, adv(s->out, s->out_dtype, lo), s->out_dtype,
+                           it->hi - lo, (uint64_t)(s->offset + lo), it->h);
+        return;
+    }
     if (s->mv_dtype == DT_FP8) {
         fp8_dispatch(s, it->h, lo, it->hi);
         return;
     }
-    fused_dispatch(s->p + lo, cadv(s->g, s->g_dtype, lo), s->g_dtype,
+    fused_dispatch(padv(s->p, pt, lo), ladv(s->p_lo, lo), pt, cadv(s->g, s->g_dtype, lo), s->g_dtype,
                    adv(s->m, s->mv_dtype, lo), adv(s->v, s->mv_dtype, lo), s->mv_dtype,
                    adv(s->out, s->out_dtype, lo), s->out_dtype, it->hi - lo, (uint64_t)(s->offset + lo), it->h);
 }
@@ -1022,20 +1530,23 @@ ADAMBRIDGE_API int adambridge_fused_adamw(float* p, const void* g, int g_dtype,
     if (out_dtype == DT_NONE) out = NULL;
 
     ensure_init();
-    fused_dispatch(p, g, g_dtype, m, v, mv_dtype, out, out_dtype, n, offset, hp);
+    fused_dispatch(p, NULL, DT_F32, g, g_dtype, m, v, mv_dtype, out, out_dtype, n, offset, hp);
     return 0;
 }
 
 static int check_segment(const adambridge_segment* s, int need_group)
 {
     if (!s || s->n < 0) return -1;
+    if (s->algorithm != ALGO_ADAMW && s->algorithm != ALGO_LION) return -12;
     if (s->n == 0) return 0;
-    if (!s->p || !s->g || !s->m || !s->v) return -2;
+    const int lion = s->algorithm == ALGO_LION;
+    if (s->p_dtype != DT_NONE && s->p_dtype != DT_F32 && s->p_dtype != DT_F24) return -13;
+    if (!s->p || !s->g || !s->m || (!lion && !s->v) || (s->p_dtype == DT_F24 && !s->p_lo)) return -2;
     if (s->g_dtype != DT_F32 && s->g_dtype != DT_BF16) return -3;
     if (s->mv_dtype != DT_F32 && s->mv_dtype != DT_BF16 && s->mv_dtype != DT_FP8) return -4;
     if (s->out_dtype != DT_NONE && s->out_dtype != DT_F32 && s->out_dtype != DT_BF16) return -5;
     if (s->out_dtype != DT_NONE && !s->out) return -6;
-    if (s->mv_dtype == DT_FP8 && (!s->m_scale || !s->v_scale)) return -7;
+    if (s->mv_dtype == DT_FP8 && (!s->m_scale || (!lion && !s->v_scale))) return -7;
     if (need_group && !s->group) return -8;
     if (s->offset < 0 || (s->mv_dtype == DT_FP8 && s->offset % FP8_BLOCK)) return -11;
     return 0;
@@ -1045,11 +1556,19 @@ static int check_segment(const adambridge_segment* s, int need_group)
  * smaller than 32K elements, always starting on a 128-element boundary (the
  * FP8 block; also keeps the SIMD/tail split independent of the thread count). */
 #define AX_MIN_PIECE 32768
+/* At most one thread per this many elements of a job: waking a helper costs more than it saves below it
+ * (WSL, 2026-11-06: 0.26M elements took 0.065 ms on 2 threads and 0.21 ms on 24; 1M: 0.20 ms on 8, 0.28 on 24;
+ * from 4M on, every thread helps). Results do not depend on the thread count. */
+#define AX_PER_THREAD 131072
 
 static int run_segments(adambridge_pool* P, adambridge_segment* const* segs, const adambridge_hparams* hps,
                         int32_t nsegs, int32_t threads)
 {
     if (threads <= 0) threads = P ? P->nthreads : 1;
+    int64_t elements = 0;
+    for (int32_t i = 0; i < nsegs; ++i)
+        if (segs[i]->n > 0) elements += segs[i]->n;
+    if (elements / AX_PER_THREAD < threads) threads = elements / AX_PER_THREAD > 1 ? (int32_t)(elements / AX_PER_THREAD) : 1;
     int64_t total = 0;
     for (int32_t i = 0; i < nsegs; ++i) {
         const int64_t n = segs[i]->n;

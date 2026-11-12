@@ -1,4 +1,4 @@
-"""Fused AdamW update kernels operating on flat host buffers.
+"""Fused AdamW (and Lion) update kernels operating on flat host buffers.
 
 Two implementations share one contract: update ``[lo, hi)`` of the FP32
 master weights and both moment stores in place, optionally writing the new
@@ -21,7 +21,7 @@ import torch
 from .native import StepCoefficients
 from .precision import MomentStore, moment_seed
 
-__all__ = ["StepCoefficients", "fused_adamw_chunk", "split_range", "chunk_ranges", "mix_seed"]
+__all__ = ["StepCoefficients", "fused_adamw_chunk", "fused_lion_chunk", "split_range", "chunk_ranges", "mix_seed"]
 
 _MASK64 = (1 << 64) - 1
 
@@ -50,8 +50,16 @@ def chunk_ranges(lo: int, hi: int, chunk: int) -> list[tuple[int, int]]:
     return [(a, min(a + chunk, hi)) for a in range(lo, hi, chunk)]
 
 
+def _master_slice(master: torch.Tensor | MomentStore, lo: int, hi: int) -> tuple[torch.Tensor, MomentStore | None]:
+    """FP32 elements ``[lo, hi)`` of the master: a view of a plain tensor (updated in place), or a store's
+    decoded copy, which must be handed back with ``store.write`` (it then holds the value stored)."""
+    if isinstance(master, torch.Tensor):
+        return master[lo:hi], None
+    return master.read(lo, hi), master
+
+
 def fused_adamw_chunk(
-    master: torch.Tensor,
+    master: torch.Tensor | MomentStore,
     grad: torch.Tensor,
     m_store: MomentStore,
     v_store: MomentStore,
@@ -63,9 +71,10 @@ def fused_adamw_chunk(
 ) -> None:
     """AdamW on elements ``[lo, hi)`` with the same arithmetic as ``torch.optim.AdamW``.
 
-    ``seed`` enables stochastic rounding of low-precision moments.
+    ``master`` is a flat FP32 tensor or a master store (FP32 or FP24). ``seed``
+    enables stochastic rounding of low-precision moments and of an FP24 master.
     """
-    p = master[lo:hi]
+    p, p_store = _master_slice(master, lo, hi)
     g = grad[lo:hi]
     if g.dtype != torch.float32:
         g = g.float()
@@ -78,7 +87,38 @@ def fused_adamw_chunk(
     denom = v.sqrt().mul_(c.inv_sqrt_bc2).add_(c.eps)
     p.addcdiv_(m, denom, value=-c.step_size)
 
+    if p_store is not None:
+        p_store.write(lo, hi, p, None if seed is None else moment_seed(seed, "p"))
     m_store.write(lo, hi, m, None if seed is None else moment_seed(seed, "m"))
     v_store.write(lo, hi, v, None if seed is None else moment_seed(seed, "v"))
+    if out is not None:
+        out[lo:hi].copy_(p)  # the value stored (an FP24 master rounds p in place)
+
+
+def fused_lion_chunk(
+    master: torch.Tensor | MomentStore,
+    grad: torch.Tensor,
+    m_store: MomentStore,
+    out: torch.Tensor | None,
+    c: StepCoefficients,
+    lo: int,
+    hi: int,
+    seed: int | None = None,
+) -> None:
+    """Lion on elements ``[lo, hi)``: ``p = p * decay - lr * sign(b1 m + (1 - b1) g)``,
+    then ``m = b2 m + (1 - b2) g`` (``c.step_size`` is the learning rate)."""
+    p, p_store = _master_slice(master, lo, hi)
+    g = grad[lo:hi]
+    if g.dtype != torch.float32:
+        g = g.float()
+    m = m_store.read(lo, hi)
+
+    update = (m * c.beta1).add_(g, alpha=1.0 - c.beta1).sign_()
+    p.mul_(c.decay).add_(update, alpha=-c.step_size)
+    m.mul_(c.beta2).add_(g, alpha=1.0 - c.beta2)
+
+    if p_store is not None:
+        p_store.write(lo, hi, p, None if seed is None else moment_seed(seed, "p"))
+    m_store.write(lo, hi, m, None if seed is None else moment_seed(seed, "m"))
     if out is not None:
         out[lo:hi].copy_(p)

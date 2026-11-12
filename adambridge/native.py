@@ -26,7 +26,6 @@ import importlib.util
 import logging
 import os
 import shlex
-import shutil
 import subprocess
 import sys
 import sysconfig
@@ -41,13 +40,15 @@ __all__ = ["NativeKernels", "Group", "Segment", "load", "build", "available", "S
 
 log = logging.getLogger("adambridge.native")
 
-ABI_VERSION = 3
+ABI_VERSION = 5
 SOURCE = Path(__file__).with_name("csrc") / "adambridge_kernels.c"
 SIMD_NAMES = {0: "scalar", 1: "avx2", 2: "avx512", 3: "neon"}
 
-DT_NONE, DT_F32, DT_BF16, DT_FP8 = 0, 1, 2, 3
+DT_NONE, DT_F32, DT_BF16, DT_FP8, DT_F24 = 0, 1, 2, 3, 4
 _DTYPE_CODES = {torch.float32: DT_F32, torch.bfloat16: DT_BF16}
 MOMENT_CODES = {"fp32": DT_F32, "bf16": DT_BF16, "fp8": DT_FP8}
+MASTER_CODES = {"fp32": DT_F32, "fp24": DT_F24}
+ALGORITHMS = {"adamw": 0, "lion": 1}
 
 
 class BuildError(RuntimeError):
@@ -88,7 +89,8 @@ class Segment(ctypes.Structure):
     """One tensor's host buffers (adambridge_segment). Pointers are raw addresses."""
 
     _fields_ = [
-        ("p", ctypes.c_void_p),
+        ("p", ctypes.c_void_p),         # FP32 master, or the FP24 hi plane (bfloat16 bits) when p_dtype is DT_F24
+        ("p_lo", ctypes.c_void_p),      # FP24 only: the lo plane (uint8)
         ("g", ctypes.c_void_p),
         ("m", ctypes.c_void_p),
         ("v", ctypes.c_void_p),
@@ -103,6 +105,8 @@ class Segment(ctypes.Structure):
         ("g_dtype", ctypes.c_int32),
         ("mv_dtype", ctypes.c_int32),
         ("out_dtype", ctypes.c_int32),
+        ("algorithm", ctypes.c_int32),  # ALGORITHMS; Lion leaves v, v_scale NULL
+        ("p_dtype", ctypes.c_int32),    # MASTER_CODES (0 means FP32)
         ("reserved", ctypes.c_int32),
     ]
 
@@ -118,6 +122,45 @@ def _lib_suffix() -> str:
 def cache_dir() -> Path:
     root = os.environ.get("ADAMBRIDGE_CACHE_DIR")
     return Path(root) if root else Path.home() / ".cache" / "adambridge"
+
+
+def _untrusted(path: Path) -> str | None:
+    """Why the compiled library at ``path`` must not be loaded, or None.
+
+    Loading a shared library runs its code, so on POSIX the file and its directory must belong to this user (or
+    root) and must not be writable by anyone else; otherwise another account could swap in its own library. (On
+    Windows the per-user profile's ACLs give the same guarantee for the default location.)"""
+    if os.name != "posix":
+        return None
+    uid = os.getuid()
+    for item in (path, path.parent):
+        st = item.stat()
+        if st.st_uid not in (uid, 0):
+            return f"{item} belongs to another user (uid {st.st_uid})"
+        if st.st_mode & 0o022:
+            return f"{item} is writable by other users (mode {st.st_mode & 0o777:o})"
+    return None
+
+
+def _which(name: str) -> str | None:
+    """Absolute path of ``name`` on PATH, searching absolute PATH entries only.
+
+    ``shutil.which`` (and CreateProcess for a bare name) also search the current directory on Windows, so
+    importing adambridge from a folder holding a planted ``gcc.exe`` would run it."""
+    exts = [""]
+    if sys.platform == "win32":
+        exts += [e for e in os.environ.get("PATHEXT", ".EXE;.BAT;.CMD").lower().split(";") if e]
+        if Path(name).suffix.lower() in exts:
+            exts = [""]
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        entry = entry.strip().strip('"')
+        if not entry or not os.path.isabs(entry):
+            continue
+        for ext in exts:
+            cand = os.path.join(entry, name + ext)
+            if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                return cand
+    return None
 
 
 def _source_tag() -> str:
@@ -136,16 +179,19 @@ def _compiler_candidates() -> list[tuple[str, list[str]]]:
     env_cc = os.environ.get("ADAMBRIDGE_CC")
     if env_cc:
         argv = shlex.split(env_cc, posix=sys.platform != "win32")
+        if argv and not os.path.isabs(argv[0]):
+            argv[0] = _which(argv[0]) or argv[0]
         kind = "msvc" if Path(argv[0]).stem.lower() == "cl" else "gnu"
         found.append((kind, argv))
     for name in ("cc", "gcc", "clang"):
-        exe = shutil.which(name)
+        exe = _which(name)
         if exe:
             found.append(("gnu", [exe]))
     if importlib.util.find_spec("ziglang") is not None:
         found.append(("gnu", [sys.executable, "-m", "ziglang", "cc"]))
-    if sys.platform == "win32" and shutil.which("cl"):
-        found.append(("msvc", ["cl"]))
+    cl = _which("cl") if sys.platform == "win32" else None
+    if cl:
+        found.append(("msvc", [cl]))
     return found
 
 
@@ -165,7 +211,8 @@ def build(force: bool = False, verbose: bool = False) -> Path:
     target = library_path()
     if target.exists() and not force:
         return target
-    target.parent.mkdir(parents=True, exist_ok=True)
+    if not target.parent.exists():
+        target.parent.mkdir(parents=True, mode=0o700)  # private: nobody else may plant a library here
     candidates = _compiler_candidates()
     if not candidates:
         raise BuildError(
@@ -217,12 +264,21 @@ class StepCoefficients:
             eps=eps,
         )
 
+    @classmethod
+    def for_lion(cls, lr: float, beta1: float, beta2: float, weight_decay: float):
+        """Lion has no bias correction: the step is ``lr * sign(c)``."""
+        return cls(beta1=beta1, beta2=beta2, decay=1.0 - lr * weight_decay, step_size=lr, inv_sqrt_bc2=1.0, eps=0.0)
+
 
 class NativeKernels:
     """Thin ctypes wrapper around the compiled library."""
 
     def __init__(self, path: Path):
         self.path = path
+        why = _untrusted(path)
+        if why:
+            raise BuildError(f"refusing to load {path}: {why}; set ADAMBRIDGE_CACHE_DIR to a directory only you "
+                             f"can write, or fix the permissions")
         lib = ctypes.CDLL(str(path))
         lib.adambridge_abi_version.restype = ctypes.c_int
         if lib.adambridge_abi_version() != ABI_VERSION:
@@ -290,7 +346,10 @@ class NativeKernels:
             raise RuntimeError("adambridge_pool_create failed")
         spin = os.environ.get("ADAMBRIDGE_SPIN")
         if spin:
-            self._lib.adambridge_pool_set_spin(handle, int(spin))
+            try:
+                self._lib.adambridge_pool_set_spin(handle, max(0, min(int(spin), 2**31 - 1)))
+            except ValueError:
+                log.warning("ignoring ADAMBRIDGE_SPIN=%r: not an integer", spin)
         return handle
 
     def destroy_pool(self, handle: int) -> None:
@@ -339,6 +398,23 @@ class NativeKernels:
         hi: int,
     ) -> None:
         """Update elements ``[lo, hi)`` of flat contiguous CPU tensors in place."""
+        # The C kernel trusts the pointers it is given: check everything it will touch.
+        n = master.numel()
+        tensors = {"master": master, "grad": grad, "m": m, "v": v, **({} if out is None else {"out": out})}
+        for name, t in tensors.items():
+            if t.device.type != "cpu" or not t.is_contiguous():
+                raise ValueError(f"{name} must be a contiguous CPU tensor")
+            if t.numel() != n:
+                raise ValueError(f"{name} has {t.numel()} elements, master has {n}")
+        if master.dtype != torch.float32:
+            raise TypeError("master must be float32")
+        for name, t in tensors.items():
+            if name != "master" and t.dtype not in _DTYPE_CODES:
+                raise TypeError(f"{name} must be float32 or bfloat16, got {t.dtype}")
+        if m.dtype != v.dtype:
+            raise TypeError("m and v must have the same dtype")
+        if not 0 <= lo <= hi <= n:
+            raise IndexError(f"range [{lo}, {hi}) outside 0..{n}")
         mv_code = _DTYPE_CODES[m.dtype]
         g_code = _DTYPE_CODES[grad.dtype]
         o_code = DT_NONE if out is None else _DTYPE_CODES[out.dtype]
